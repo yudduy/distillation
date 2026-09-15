@@ -1,178 +1,109 @@
-You are deciding whether source law A (Eq1: {{ equation1 }}) implies target law B (Eq2: {{ equation2 }}) over all magmas.
+You are deciding whether law A (Eq1: {{ equation1 }}) implies law B (Eq2: {{ equation2 }}) over all magmas.
 
-A magma is a set with one binary operation `*` and no axioms. Variables are universally quantified. "A implies B" means every magma satisfying A for all assignments also satisfies B for all assignments.
+A magma is a set with one binary operation * and no axioms. Variables are universally quantified. "A implies B" means every magma that satisfies A for all assignments also satisfies B for all assignments. Two facts drive everything below:
+(1) FALSE is proved by ONE magma that satisfies A but fails B.
+(2) TRUE is proved when B is a syntactic consequence of A, or when A is so strong that only a one-element magma satisfies it.
+(3) When no listed magma separates A from B and no syntactic rule applies, the fallback in Step 4 gives the verdict from the shape of A; that is the intended default, not a guess.
+Apply the steps in order and STOP at the first rule that fires. Do every check explicitly from the parsed fields; never invent a magma that is not listed here.
 
-Rules: deterministic classifier. Apply rules in order; stop at the FIRST that fires. Never invent witnesses. If no rule fires, apply the Layer B decision tree at the end.
-
-OUTPUT FORMAT — first write the PARSE block and brief rule trace, then end with EXACTLY these four lines, no markdown, no extra text after COUNTEREXAMPLE:
+OUTPUT FORMAT: write the PARSE block and a short rule trace, then end with EXACTLY these four lines, no markdown, nothing after COUNTEREXAMPLE:
 VERDICT: TRUE or FALSE
-REASONING: one rule name from {X1 X2 X3 F1 F2 F3 F4 C1 C2 C3 C4 C5 C6 C7 C8 C9 C10 C11 C12 C13 C14 S1 S2 S3 S4 S5 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 H1 H2 H3 H4 H5 H6 B1 B2a B2b B2c}
+REASONING: one rule name from {X1 X3 X4 F1 F2 F3 F4 F5 C0 LP0 LP2 LP3 RP0 RP2 RP3 SET PARITY W1 W2 W3 W4 B1 B2a B2b B2c}
 PROOF: one short sentence if VERDICT is TRUE, otherwise empty
 COUNTEREXAMPLE: one short sentence if VERDICT is FALSE, otherwise empty
 
-=== STEP 0 — MANDATORY PARSE (write before applying any rule) ===
+=== STEP 0 - PARSE (mandatory, write it before any rule) ===
 
-For EACH of the four sides — A.L, A.R, B.L, B.R — write one PARSE line:
+For each of the four sides A.L, A.R, B.L, B.R write one line:
+  PARSE <side>: shape=<fully parenthesized>  vars={..}  occs={v:k,..}  op=<n>  bare=<Y/N>  lm=<v> ld=<n>  rm=<v> rd=<n>
+Read the side as a binary tree; every * is a node. Input may be written with spaces around * (x = y * x); spacing means nothing.
+  op = number of * on this side. bare = Y iff the side is a single variable (op = 0).
+  lm = leftmost leaf; ld = number of * nodes on the path from the root to lm (always taking the left child).
+  rm = rightmost leaf; rd = number of * nodes on the path from the root to rm (always taking the right child).
+  A bare side v has lm=rm=v and ld=rd=0.
+Example x*(y*x): shape=(x*(y*x)) vars={x,y} occs={x:2,y:1} op=2 bare=N lm=x ld=1 rm=x rd=2.
+Example (x*y)*(z*x): lm=x ld=2 rm=x rd=2.
 
-  PARSE <side>: shape=<expr>  vars={...}  occs={v:k,...}  op=<n>  bare=<Y/N>  lm=<v>  rm=<v>  ldepth=<n>  rdepth=<n>
+Then write LEAVES <side>: every leaf occurrence with (L,R) = number of left branches and right branches on its path from the root.
+Example (x*y)*(z*x): x(2,0) y(1,1) z(1,1) x(0,2). Example x*(y*x): x(1,0) y(1,1) x(0,2). Bare v: v(0,0).
 
-Field definitions (walk the expression as a binary tree; every * is a node):
-  shape   = the side fully parenthesized as written
-  vars    = SET of distinct variable letters on this side
-  occs    = occurrence count of each variable (e.g. {x:2,y:1})
-  op      = count of * symbols on this side
-  bare    = Y iff the side is a single variable letter
-  lm      = leftmost variable letter (walk root → left child → ... to leaf)
-  rm      = rightmost variable letter (walk root → right child → ... to leaf)
-  ldepth  = number of * nodes on left-child path to the leftmost leaf
-  rdepth  = number of * nodes on right-child path to the rightmost leaf
+=== STEP 1 - TRUE BY SYNTAX ===
 
-Bare side shorthand: shape=v  vars={v}  occs={v:1}  op=0  bare=Y  lm=v  rm=v  ldepth=0  rdepth=0.
-Worked parse of  x*(y*x):  shape=(x*(y*x))  vars={x,y}  occs={x:2,y:1}  op=2  bare=N  lm=x  rm=x  ldepth=1  rdepth=2.
+X1: B.L and B.R are the same string -> TRUE.
+X3: A has a bare side whose variable does not occur on the other side (e.g. x = y*z, x = y*(z*y)) -> TRUE. Such an A forces all elements equal, so every law holds.
+X4 (instance): B is A with terms substituted for A's variables, the same term at every occurrence of that variable, possibly after swapping A's two sides. Check: overlay A.L on B.L and A.R on B.R node by node from the root; a * node of A must land on a * node of B; a variable of A may land on any subterm of B but must land on the same subterm every time. If it works, or works with A's sides swapped -> TRUE. Renaming variables is a special case. Example: A: x*y = y*x, B: (x*z)*y = y*(x*z): x->(x*z), y->y, TRUE. Direction matters: A being an instance of B proves nothing.
 
-Do NOT skip Step 0. All downstream rules use only these parsed values.
+=== STEP 2 - PROJECTION LAWS (decide either way) ===
 
-=== STEP 1 — FEATURES ===
+In F1-F5, x, y, u, v, w stand for SINGLE variables (not subterms); "up to renaming and side swap" is allowed. x = x*(x*y) is NOT F1.
+F1: A is x = x*y with x != y. Then a*b = a in every model, so every term equals its lm. TRUE iff lm(B.L) = lm(B.R), else FALSE.
+F2: A is x = y*x with x != y. Then a*b = b. TRUE iff rm(B.L) = rm(B.R), else FALSE.
+F3: A is u*v = u*w with u, v, w single variables and v != w (e.g. x*y = x*z, x*x = x*y). Then a*b = f(a) for an arbitrary function f, so a term equals f applied ld times to lm. TRUE iff (lm, ld) of B.L equals (lm, ld) of B.R, else FALSE.
+F4: A is v*u = w*u with v != w (e.g. x*y = z*y, x*x = y*x). Then a*b = g(b). TRUE iff (rm, rd) of B.L equals (rm, rd) of B.R, else FALSE.
+F5: one side of A is u*v with u != v single variables, and the other side is a product containing neither u nor v (e.g. x*y = z*w, x*x = y*z, x*y = z*(w*z)). Then every product equals one constant. TRUE iff neither side of B is bare, else FALSE.
 
-For each expression tree read: leaves left-to-right, leftmost leaf, rightmost leaf.
-left-depth = left-branches on path to leftmost leaf. right-depth = right-branches on path to rightmost leaf.
-Example: x*(y*z) leftmost x left-depth 1, rightmost z right-depth 2. (x*z)*w leftmost x left-depth 2, rightmost w right-depth 1.
+=== STEP 3 - SEPARATING MAGMAS (FALSE) ===
 
-For each equation E (sides L, R):
-- vars(E): distinct variable letters in L or R
-- size(E): total variable occurrences; dup(E) = size(E) - vars(E)
-- LP(E): leftmost leaves match. RP(E): rightmost leaves match.
-- SET(E): variable-sets equal. XOR(E): every var same parity both sides. AB(E): every var same count both sides.
-- bare(E): exactly one side is a lone variable (bare), the other a product.
+Each test names a magma and the exact condition under which a law holds in it. Compute the condition for A and for B. If A holds and B fails -> FALSE, name the test. If A fails, that magma proves nothing; go to the next test. If both hold, go to the next test. Run the tests in this order.
 
-If bare(E), call bare variable x. Define:
-- kind(E) = L (all x-paths left-only) | R (all right-only) | M (any path mixes) | X (x absent from product) | N (not bare)
-- shortest_len(E) = depth of shallowest x on product side (-1 if N)
-- occ(E) = x-occurrences on product side (0 if N)
+C0 constant magma (a*b = 0 on {0,1}): a law holds iff neither side is bare. So: A has no bare side AND B has a bare side -> FALSE.
+LP0 (a*b = a): holds iff lm(L) = lm(R).
+LP2 (a*b = a+1 mod 2): holds iff lm(L) = lm(R) AND ld(L) = ld(R) mod 2.
+LP3 (a*b = a+1 mod 3): holds iff lm(L) = lm(R) AND ld(L) = ld(R) mod 3.
+RP0 (a*b = b): holds iff rm(L) = rm(R).
+RP2 (a*b = b+1 mod 2): holds iff rm(L) = rm(R) AND rd(L) = rd(R) mod 2.
+RP3 (a*b = b+1 mod 3): holds iff rm(L) = rm(R) AND rd(L) = rd(R) mod 3.
+SET (a*b = max(a,b) on {0,1}): holds iff vars(L) = vars(R) as sets.
+PARITY (a*b = a+b mod 2): holds iff every variable has the same parity of occurrence count on both sides.
+Weighted tests W1-W4: from LEAVES give each leaf a weight w(L,R), add the weights of each variable on each side (a variable missing from a side sums to 0), and compare per variable mod m. Reduce each sum to the range 0..m-1 first (-1 = 2 mod 3; -1 = 3 and -2 = 2 mod 4). Holds iff every variable's two reduced sums are equal.
+  W1 (a*b = 2a+2b mod 3): w = +1 if L+R is even, -1 if odd. m = 3.
+  W2 (a*b = a+2b mod 3): w = +1 if R is even, -1 if R is odd. m = 3.
+  W3 (a*b = 3a+2b mod 4): if R = 0: w = +1 for L even, -1 for L odd; if R = 1: w = 2; if R >= 2: w = 0. m = 4.
+  W4 (a*b = 2a+3b mod 4): if L = 0: w = +1 for R even, -1 for R odd; if L = 1: w = 2; if L >= 2: w = 0. m = 4.
 
-=== STEP 2 — IDENTITY / COLLAPSE (TRUE) ===
+=== STEP 4 - FALLBACK (no rule above fired) ===
 
-X1: B.L = B.R syntactically -> TRUE.
-X2: A and B same up to consistent renaming, optional side-swap of A -> TRUE.
-X3: A is `x = y` (x != y), OR A has a lone-variable side whose variable is absent from the other side -> TRUE.
+Compute from A only: M = the smallest total occurrence count (both sides of A together) of any variable of A. S = number of * in A.L. V = number of distinct variables in A.L.
+B1: M >= 2 -> FALSE. Every variable of A is pinned on both sides, so A is a weak law with many models; it rarely forces B.
+B2a: else if S = 0 (A.L is bare) -> TRUE. A has a free parameter and a bare side, so it is rigid, and no listed magma separated it from B.
+B2b: else if S = 1 and V = 2 (A.L is a product of two distinct variables) -> TRUE.
+B2c: otherwise -> FALSE.
 
-=== STEP 3 — FORCED BEHAVIOR ===
+=== WORKED EXAMPLES (traces abbreviated) ===
 
-F1: A is `x = x*y` (up to renaming/side-swap, x != y) -> forces a*b=a. TRUE iff LP(B); else FALSE.
-F2: A is `x = y*x` (up to renaming/side-swap, x != y) -> forces a*b=b. TRUE iff RP(B); else FALSE.
-F3: Both sides of A are products of two variables; same left child, different right children -> forces a*b=f(a). TRUE iff (leftmost,left-depth) pairs of B.L and B.R match; else FALSE.
-F4: Both sides of A are products of two variables; same right child, different left children -> forces a*b=g(b). TRUE iff (rightmost,right-depth) pairs of B.L and B.R match; else FALSE.
-
-=== STEP 4 — SOURCE CONTRADICTION MOTIFS (TRUE) ===
-
-Apply ONLY when bare(A). Let bare variable = x. Compute for product side of A:
-- rhsVars: distinct variable count. rhsCounts: sorted occurrence counts as digit string.
-  (e.g. {x:1,y:1,z:2}->"112"; {x:1,y:1,z:3}->"113"; {x:2,y:2,z:1}->"122"; {x:2,y:1,z:1,w:1}->"1112")
-- Lx: leftmost is x. Rx: rightmost is x.
-- topShape: top split U*V — "v-m" (U var, V product), "m-v" (U product, V var), "m-m".
-- xTop: "left"(x only in U) | "right"(x only in V) | "both" | "none". xCount: x-occurrences.
-- square: some subterm is u*u.
-
-C1: rhsVars=4 AND Lx=F AND Rx=F -> TRUE
-C2: rhsCounts="113" AND Lx=F AND Rx=F -> TRUE
-C3: Lx=F AND xTop=left AND square=T AND topShape=m-v -> TRUE
-C4: rhsCounts="112" AND Lx=F AND Rx=F AND xTop=right AND topShape=v-m -> TRUE
-C5: rhsCounts="1112" AND Lx=F AND Rx=F AND xTop=right AND topShape=v-m -> TRUE
-C6: rhsVars=3 AND xTop=right AND topShape=v-m AND xCount=2 -> TRUE
-C7: rhsVars=3 AND Lx=F AND Rx=F AND xTop=left AND topShape=m-v AND xCount=2 -> TRUE
-C8: rhsVars=3 AND Lx=T AND xTop=left AND topShape=m-v -> TRUE
-C9: rhsCounts="122" AND Lx=T AND Rx=F AND xTop=both AND topShape=v-m -> TRUE
-C10: rhsCounts="122" AND Lx=F AND Rx=T AND xCount=2 -> TRUE
-C11: rhsCounts="113" AND Lx=F AND Rx=F AND xTop=right AND topShape=v-m -> TRUE
-C12: rhsCounts="113" AND Lx=F AND Rx=F AND xTop=left AND topShape=m-v -> TRUE
-C13: rhsCounts="1112" AND Lx=F AND Rx=T -> TRUE
-C14: bare(B)=T AND rhsCounts="113" AND Rx=T AND square=F -> TRUE
-
-=== STEP 5 — SEPARATORS (FALSE) ===
-
-S1: LP(A) AND NOT LP(B) -> FALSE.
-S2: RP(A) AND NOT RP(B) -> FALSE.
-S3: SET(A) AND NOT SET(B) -> FALSE.
-S4: XOR(A) AND NOT XOR(B) -> FALSE.
-S5: AB(A) AND NOT AB(B) -> FALSE.
-
-=== STEP 6 — AFFINE PROBES (FALSE) ===
-
-u*v = p*u + q*v + c (mod m). eval(var)=var; eval(P*Q) = p*eval(P)+q*eval(Q)+c mod m.
-Equal iff all coefficients AND constant match. For each probe: if A.L!=A.R skip; if A.L=A.R and B.L!=B.R -> FALSE. Run ALL A1-A10.
-
-A1 SHORTCUT: eval_A1(T) = rightmost_leaf(T) + right_depth(T) mod 3.
-IMPORTANT: right_depth counts every right-branch to the actual leaf — go through product nodes (e.g. in x*x the leaf is the right child x, not x*x). Never stop at a product subterm.
-If bare(A) AND Rx=T AND right_depth(product_side) mod 3 = 0: A1 admits A. Compute eval_A1(B.L), eval_A1(B.R). If differ -> FALSE(A1). Else continue.
-
-A7 SHORTCUT: Under A7 (u*v=3u+2v mod 4), leaf at L left- and R right-branches has coef 3^L*2^R mod 4.
-R=0: coef=3^L mod 4 (1 if L even, 3 if L odd). R=1: coef=2. R>=2: coef=0 (skip).
-If bare(A) AND product side = x*(x*Q) (topShape=v-m, Lx=T, left-child-of-right-subtree=x):
-  A7 admits A. Compute eval_A7(B.L), eval_A7(B.R) via R<=1 rule. If differ -> FALSE(A7).
-
-A1:  u*v = v+1      mod 3    A2:  u*v = u+1      mod 3    A3:  u*v = u+v      mod 3
-A4:  u*v = u+2v     mod 3    A5:  u*v = 2u+2v    mod 3    A6:  u*v = 2u+3v    mod 4
-A7:  u*v = 3u+2v    mod 4    A8:  u*v = u+2v     mod 4    A9:  u*v = 2u+v+1   mod 4
-A10: u*v = 3u+3v    mod 5
-
-=== STEP 7 — HEURISTIC REJECTS (FALSE) ===
-
-H1: kind(A)=M AND vars(A)>=4 AND kind(B)=X -> FALSE
-H2: kind(A)=L AND shortest_len(A)=1 AND dup(A)>=3 AND bare(B)=F AND dup(B)>=3 AND vars(B)<=3 -> FALSE
-H3: kind(A)=M AND occ(A)=2 AND NOT RP(A) AND Lx(A)=F -> FALSE
-H4: shortest_len(A)=1 AND occ(A)=3 -> FALSE  [fires regardless of Rx, Lx, or kind]
-H5: kind(A)=M AND shortest_len(A)=3 AND occ(A)=2 -> FALSE
-H6: kind(A)=L AND occ(B)=2 AND vars(B)=4 -> FALSE
-
-=== STEP 8 — LAYER B DECISION TREE (fallback instead of DEFAULT) ===
-
-If no rule above fired, compute three integers about Eq1 ONLY:
-
-M = for each variable v appearing anywhere in Eq1, count its total occurrences across BOTH sides of Eq1. M is the smallest such count. If some variable appears only once, M = 1.
-
-S = number of * symbols on Eq1's LHS. If LHS is a bare variable, S = 0.
-
-V = distinct variable count on Eq1's LHS. If LHS is bare, V = 1.
-
-Apply tree in order:
-
-B1: If M >= 2 -> FALSE. Reason: every variable in Eq1 is constrained in both sides, so Eq1 is too loose to force a tighter Eq2.
-B2a: Else (M = 1) AND S = 0 (Eq1 LHS is a bare variable) -> TRUE. Reason: Eq1 forces the bare variable to equal a product involving a free parameter, which is rigid.
-B2b: Else S = 1 AND V = 2 (Eq1 LHS is x*y with distinct x, y) -> TRUE. Reason: Eq1 is a two-variable product law with rigid LHS.
-B2c: Otherwise -> FALSE. Reason: complex Eq1 LHS with a free parameter is generally too permissive to force Eq2.
-
-=== WORKED EXAMPLES ===
-
-TRUE (F2): A: x=y*x. B: x=x*(x*((y*z)*x)).
-F2 fires. Under a*b=b every term reduces to rightmost leaf. B.L rightmost=x, B.R rightmost=x.
+A: x = y*x. B: x = x*(x*((y*z)*x)).
+No X rule. F2 fires: rm(B.L)=x, rm(B.R)=x.
 VERDICT: TRUE
 REASONING: F2
-PROOF: A forces a*b=b, so both sides of B reduce to x.
+PROOF: A forces a*b=b, so both sides of B reduce to their rightmost leaf x.
 COUNTEREXAMPLE:
 
-FALSE (A1): A: x=y*(y*(x*x)). B: x=y*(z*(y*(x*x))).
-A1 shortcut: Rx=T. Trace right_depth of y*(y*(x*x)):
-  root->right->y*(x*x)[1], y*(x*x)->right->x*x[2], x*x->right->x(leaf)[3].
-right_depth=3, 3 mod 3=0. Fires. eval_A1(B.L)=x.
-B.R=y*(z*(y*(x*x))): root->right->z*(y*(x*x))[1]->y*(x*x)[2]->x*x[3]->x(leaf)[4].
-right_depth=4. eval_A1(B.R)=x+4=x+1 (mod 3). x != x+1 -> FALSE(A1).
+A: x*y = y*(x*y). B: x = (y*x)*y.
+No X or F rule. C0: A has no bare side, B.L is bare -> FALSE.
 VERDICT: FALSE
-REASONING: A1
+REASONING: C0
 PROOF:
-COUNTEREXAMPLE: In Z_3 with u*v=v+1, A holds but B fails.
+COUNTEREXAMPLE: In the constant magma a*b=0 on {0,1}, A holds but B fails at x=1.
 
-FALSE (B1): A: x*y = y*x. B: x*(y*z) = (x*y)*z.
-No A/F/C/S/H rule fires. Layer B: variables in A are {x,y} with counts x:2, y:2. M = min(2,2) = 2. B1 fires.
+A: x = y*(y*(x*x)). B: x = y*(z*(y*(x*x))).
+No X or F rule. C0: A has a bare side, skip. LP0: lm(A.L)=x, lm(A.R)=y, A fails, skip. LP2, LP3 skip likewise. RP0: rm(A.L)=x, rm(A.R)=x, A holds; rm(B.L)=x, rm(B.R)=x, B holds. RP2: rd(A.L)=0, rd(A.R)=3, 0=3 mod 2 fails, skip. RP3: rd(A.R)=3, 0=3 mod 3, A holds; rd(B.L)=0, rd(B.R)=4, 0!=4 mod 3, B fails -> FALSE.
 VERDICT: FALSE
-REASONING: B1
+REASONING: RP3
 PROOF:
-COUNTEREXAMPLE: Eq1 (commutativity) does not imply Eq2 (associativity); e.g. Z_3 with u*v = 2u+2v mod 3 satisfies commutativity but not associativity.
+COUNTEREXAMPLE: In Z_3 with a*b = b+1, A holds but B fails.
 
-TRUE (B2a): A: x = y*(z*x). B: x = (z*y)*x.
-No strict A/F/C/S/H rule fires. Layer B: vars in A are {x,y,z} with counts x:2, y:1, z:1. M = 1. A.LHS is bare x, so S = 0. B2a fires.
+A: x = x*(x*(x*y)). B: x = (x*(y*(x*x)))*z.
+No X rule; F1 does not apply (x*(x*(x*y)) is not x*y). C0 skip (A has a bare side). LP0: lm(A.L)=x, lm(A.R)=x, A holds; lm(B.L)=x, lm(B.R)=x, B holds. LP2: ld(A) 0 vs 1, A fails. LP3: same, skip. RP0: rm(A) x vs y, A fails; RP2, RP3 skip. SET: A fails. PARITY: y once in A, fails. W1: y once with weight -1, A fails. W2: y(0,3) has R odd, weight -1, fails. W3: LEAVES A.R: x(1,0) x(1,1) x(1,2) y(0,3) -> weights -1, 2, 0, 0; sums x: -1+2 = 1, y: 0. A.L: x(0,0) -> x: 1. A holds (x 1=1, y 0=0 mod 4). LEAVES B.R: x(2,0) y(2,1) x(2,2) x(1,3) z(0,1) -> weights 1, 2, 0, 0, 2; sums x: 1, y: 2, z: 2. B.L: x: 1. y: 0 vs 2 mod 4, B fails -> FALSE.
+VERDICT: FALSE
+REASONING: W3
+PROOF:
+COUNTEREXAMPLE: In Z_4 with a*b = 3a+2b, A holds but B fails.
+
+A: x = y*(z*(z*x)). B: x = (x*x)*(x*(y*x)).
+No X or F rule. C0 skip (A has a bare side). LP0/LP2/LP3: lm(A.L)=x, lm(A.R)=y, A fails, skip. RP0: rm=x on all four sides, no fire. RP2: rd(A) 0 vs 3, A fails, skip. RP3: 0=3 mod 3, A holds; rd(B) 0 vs 3, B holds, no fire. SET: vars differ in A, skip. PARITY: y occurs once, skip. W1-W4: y occurs once with nonzero weight, A fails each, skip. Fallback: counts x:2 y:1 z:2, M=1; A.L is bare, S=0. B2a fires.
 VERDICT: TRUE
 REASONING: B2a
-PROOF: Eq1 has a free parameter and bare LHS; fallback rule B2a applies.
+PROOF: A has a free parameter and a bare side; no listed magma separates A from B.
 COUNTEREXAMPLE:
 
-Stop at first firing rule; Layer B provides the final verdict; never invent witnesses.
+Stop at the first firing rule. The fallback always yields a verdict. Never invent a witness.
