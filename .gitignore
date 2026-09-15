@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 score.json
 score.json.tmp
+evaluation-costs.json
+evaluation-costs.json.tmp
 .env*
 !.env.example
 private/

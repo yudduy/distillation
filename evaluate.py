@@ -212,13 +212,17 @@ def live_settings(env):
     return key, cap
 
 
+def hosted_workflow(env) -> bool:
+    workflow_prefix = f'{HOSTED_REPOSITORY}/.github/workflows/benchmark.yml@'
+    return (env.get('GITHUB_ACTIONS') == 'true' and env.get('GITHUB_REPOSITORY') == HOSTED_REPOSITORY
+            and env.get('GITHUB_WORKFLOW_REF', '').startswith(workflow_prefix))
+
+
 def uncapped_hosted_mode(env) -> bool:
     """Allow an unlimited key only in the protected operator workflow."""
     if env.get('DISTILL_ALLOW_UNCAPPED') != '1':
         return False
-    workflow_prefix = f'{HOSTED_REPOSITORY}/.github/workflows/benchmark.yml@'
-    if (env.get('GITHUB_ACTIONS') != 'true' or env.get('GITHUB_REPOSITORY') != HOSTED_REPOSITORY
-            or not env.get('GITHUB_WORKFLOW_REF', '').startswith(workflow_prefix)):
+    if not hosted_workflow(env):
         raise InvalidRun('uncapped_hosted_context_invalid')
     return True
 
@@ -389,6 +393,14 @@ class BudgetLedger:
             'unresolvedReservedUsd': amount(self.unresolved),
             'models': models,
         }
+
+
+def write_cost_artifact(ledger: BudgetLedger, status: str) -> None:
+    path = ROOT / 'evaluation-costs.json'
+    temporary = path.with_suffix('.json.tmp')
+    payload = {'contractVersion': CONTRACT, 'status': status, 'billing': ledger.metrics()}
+    temporary.write_text(json.dumps(payload, allow_nan=False, sort_keys=True) + '\n')
+    temporary.replace(path)
 
 
 def base_transport() -> httpx.AsyncBaseTransport:
@@ -563,8 +575,11 @@ async def live_evaluate(rows, template, env):
     if set(configs) != set(MODEL_IDS):
         raise InvalidRun('model_config_mismatch')
     ledger = BudgetLedger(cap)
+    hosted = hosted_workflow(env)
+    completed = {alias: 0 for alias in MODEL_IDS}
     receipts = private_receipts(env)
     transport = GuardedTransport(base_transport(), ledger, receipts, reject_byok=uncapped)
+    status = 'failed'
     try:
         async with httpx.AsyncClient(transport=transport, timeout=180, trust_env=False, follow_redirects=False) as client:
             response = await client.get('https://openrouter.ai/api/v1/key', headers={'Authorization': f'Bearer {key}'})
@@ -580,18 +595,32 @@ async def live_evaluate(rows, template, env):
                 expected = 'novita' if alias == 'gemma-4-31b-it' else 'deepinfra'
                 if (response.actual_provider or '').lower().split('/')[0] != expected:
                     raise InvalidRun('provider_route_mismatch')
+                completed[alias] += 1
+                if hosted and completed[alias] % 20 == 0:
+                    print(json.dumps({'event': 'evaluation_progress', 'model': alias,
+                                      'completed': completed[alias]}), flush=True)
                 return response
             result = await evaluate(rows, template, complete, model_concurrency=MODEL_CONCURRENCY)
             result['metrics']['billing'] = ledger.metrics()
+            status = 'succeeded'
             return result
     finally:
         if receipts is not None:
             receipts.close()
+        if hosted:
+            try:
+                write_cost_artifact(ledger, status)
+            except Exception:
+                # Preserve the original evaluation failure; successful runs require observability.
+                if status == 'succeeded':
+                    raise InvalidRun('cost_artifact_unavailable') from None
 
 
 async def run(args, env=os.environ, evaluator=live_evaluate):
     score_path = ROOT / 'score.json'
     score_path.unlink(missing_ok=True)
+    (ROOT / 'evaluation-costs.json').unlink(missing_ok=True)
+    (ROOT / 'evaluation-costs.json.tmp').unlink(missing_ok=True)
     verify_vendor()
     template, data = read_prompt(ROOT / 'submission/prompt.txt')
     ranked = args.ranked

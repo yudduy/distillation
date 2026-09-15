@@ -117,7 +117,8 @@ def test_uncapped_mode_is_limited_to_operator_workflow():
 
 
 @pytest.mark.asyncio
-async def test_uncapped_hosted_run_skips_key_cap_but_requires_non_byok_usage(monkeypatch):
+async def test_uncapped_hosted_run_skips_key_cap_but_requires_non_byok_usage(monkeypatch, tmp_path):
+    monkeypatch.setattr(e, 'ROOT', tmp_path)
     requests = 0
     async def handler(req):
         nonlocal requests
@@ -138,11 +139,14 @@ async def test_uncapped_hosted_run_skips_key_cap_but_requires_non_byok_usage(mon
         [{'equation1':'a','equation2':'b','answer':True}], TEMPLATE, uncapped_env())
     assert result['score'] == 1 and requests == 3
     assert result['metrics']['billing']['confirmedSpendUsd'] == '0.003'
+    artifact = json.loads((tmp_path/'evaluation-costs.json').read_text())
+    assert artifact['status'] == 'succeeded' and artifact['billing'] == result['metrics']['billing']
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('is_byok', [True, None])
-async def test_uncapped_hosted_run_rejects_byok_or_unreported_billing(monkeypatch, is_byok):
+async def test_uncapped_hosted_run_rejects_byok_or_unreported_billing(monkeypatch, tmp_path, is_byok):
+    monkeypatch.setattr(e, 'ROOT', tmp_path)
     async def handler(req):
         if req.url.path.endswith('/key'):
             return httpx.Response(200, json={'data': {}})
@@ -209,9 +213,82 @@ async def test_real_client_routing_and_8192_cap(monkeypatch):
 async def test_stale_score_removed_without_credentials(tmp_path,monkeypatch):
     monkeypatch.setattr(e,'ROOT',tmp_path)
     (tmp_path/'score.json').write_text('{"score":1}')
+    (tmp_path/'evaluation-costs.json').write_text('{"status":"stale"}')
+    (tmp_path/'evaluation-costs.json.tmp').write_text('stale')
     (tmp_path/'submission').mkdir(); (tmp_path/'submission/prompt.txt').write_text(TEMPLATE)
     with pytest.raises(e.InvalidRun): await e.run(SimpleNamespace(ranked=False),{})
     assert not (tmp_path/'score.json').exists()
+    assert not (tmp_path/'evaluation-costs.json').exists()
+    assert not (tmp_path/'evaluation-costs.json.tmp').exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_hosted_evaluation_persists_sanitized_costs_without_score(tmp_path, monkeypatch):
+    monkeypatch.setattr(e, 'ROOT', tmp_path)
+    (tmp_path/'submission').mkdir()
+    (tmp_path/'submission/prompt.txt').write_text(TEMPLATE)
+    async def handler(req):
+        if req.url.path.endswith('/key'):
+            return httpx.Response(200, json={'data': {}})
+        return httpx.Response(200, json={
+            'provider': 'PRIVATE WRONG PROVIDER',
+            'usage': {'cost':'0.001', 'prompt_tokens':1, 'completion_tokens':1,
+                      'is_byok':False},
+            'choices':[{'finish_reason':'stop', 'message':{'content':'PRIVATE RESPONSE'}}],
+        })
+    monkeypatch.setattr(e, 'base_transport', lambda: httpx.MockTransport(handler))
+    with pytest.raises(e.InvalidRun, match='provider_route_mismatch'):
+        await e.run(SimpleNamespace(ranked=False), uncapped_env())
+    assert not (tmp_path/'score.json').exists()
+    serialized = (tmp_path/'evaluation-costs.json').read_text()
+    artifact = json.loads(serialized)
+    assert set(artifact) == {'contractVersion', 'status', 'billing'}
+    assert artifact['status'] == 'failed' and artifact['billing']['attempts'] > 0
+    assert 'PRIVATE' not in serialized and 'attemptId' not in serialized
+
+
+@pytest.mark.asyncio
+async def test_hosted_progress_is_coarse_and_sanitized(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(e, 'ROOT', tmp_path)
+    async def handler(req):
+        if req.url.path.endswith('/key'):
+            return httpx.Response(200, json={'data': {}})
+        body = json.loads(req.content)
+        provider = 'Novita' if body['model'].startswith('google/') else 'DeepInfra'
+        return httpx.Response(200, json={
+            'provider':provider,
+            'usage':{'cost':'0.001', 'prompt_tokens':1, 'completion_tokens':1,
+                     'is_byok':False},
+            'choices':[{'finish_reason':'stop', 'message':{'content':'VERDICT: TRUE'}}],
+        })
+    monkeypatch.setattr(e, 'base_transport', lambda: httpx.MockTransport(handler))
+    rows = [{'equation1':f'PRIVATE {i}', 'equation2':'SECRET', 'answer':True}
+            for i in range(20)]
+    await e.live_evaluate(rows, TEMPLATE, uncapped_env(OPENROUTER_API_KEY='PRIVATE KEY'))
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(events) == 3
+    assert {event['model'] for event in events} == set(e.MODEL_IDS)
+    assert all(event == {'event':'evaluation_progress', 'model':event['model'], 'completed':20}
+               for event in events)
+    assert 'PRIVATE' not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_cost_write_error_does_not_mask_evaluation_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(e, 'ROOT', tmp_path)
+    async def handler(req):
+        if req.url.path.endswith('/key'):
+            return httpx.Response(200, json={'data': {}})
+        return httpx.Response(200, json={
+            'provider':'WrongProvider',
+            'usage':{'cost':'0', 'is_byok':False},
+            'choices':[{'finish_reason':'stop', 'message':{'content':'VERDICT: TRUE'}}],
+        })
+    monkeypatch.setattr(e, 'base_transport', lambda: httpx.MockTransport(handler))
+    monkeypatch.setattr(e, 'write_cost_artifact', lambda *_: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(e.InvalidRun, match='provider_route_mismatch'):
+        await e.live_evaluate(
+            [{'equation1':'a','equation2':'b','answer':True}], TEMPLATE, uncapped_env())
 
 
 def entries():

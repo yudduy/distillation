@@ -65,6 +65,12 @@ attempt/reservation IDs, route, status, elapsed time, token/cost coverage, and
 BYOK status only. They are private ephemeral accounting data and must never be
 uploaded with `score.json`; the ranked workflow removes them during cleanup.
 
+Hosted runs emit a progress event after every 20 completed responses per model.
+They also upload `evaluation-costs.json` on success or failure with sanitized
+per-model cost, token, timing, and HTTP-status aggregates. It contains no questions,
+answers, responses, credentials, or receipt identifiers and is separate from the
+success-only `score.json` artifact.
+
 The ranked panel has 100 TRUE and 100 FALSE questions. All three models answer all
 200. `score = correct / 600`, in [0, 1]. Wrong answers, refusals, and unparseable
 completed answers count as incorrect. Valid parseable answers at the token limit
@@ -121,8 +127,9 @@ within one marker type the last occurrence wins. See the upstream README for det
    validation, rejection, and promotion in dev before any production rollout.
 
 Do not publish partial results or logs containing questions, expected labels,
-responses, private paths, or raw HTTP error bodies. Only `score.json` is uploaded.
-It contains aggregate per-model accuracy, parse-failure counts, token counts,
+responses, private paths, or raw HTTP error bodies. Only `score.json` and the
+sanitized `evaluation-costs.json` accounting artifact are uploaded. The score contains
+aggregate per-model accuracy, parse-failure counts, token counts,
 prompt size/hash, candidate SHA, run ID, and dataset/configuration identities.
 No participant PII or provider credentials belong in this artifact.
 

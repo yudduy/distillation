@@ -46,6 +46,14 @@ jobs:
           path: score.json
           if-no-files-found: error
           retention-days: 7
+      - name: Upload aggregate evaluation costs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: evaluation-costs
+          path: evaluation-costs.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Remove private runtime files
         if: always()
         run: rm -f "$DISTILL_PRIVATE_DATASET" "$DISTILL_PRIVATE_RECEIPTS"
