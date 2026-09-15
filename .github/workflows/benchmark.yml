@@ -1,0 +1,48 @@
+name: Math Distillation ranked evaluation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+# This workflow belongs to the separate operator repository, not Yukon's CI.
+concurrency:
+  group: math-distillation-ranked
+  cancel-in-progress: false
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    environment: ranked
+    env:
+      DISTILL_PRIVATE_DATASET: ${{ runner.temp }}/distill-private/ranked.jsonl
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12.12'
+      - name: Set up pinned evaluator
+        run: ./setup.sh
+      - name: Offline contract checks
+        run: .venv/bin/python -m pytest tests vendor/sair/tests -q
+      - name: Load private fixture
+        env:
+          DISTILL_PRIVATE_DATA_GZIP_BASE64: ${{ secrets.DISTILL_PRIVATE_DATA_GZIP_BASE64 }}
+        run: .venv/bin/python prepare_private.py
+      - name: Evaluate
+        env:
+          DISTILL_LIVE: ${{ vars.DISTILL_LIVE }}
+          DISTILL_MAX_SPEND_USD: ${{ vars.DISTILL_MAX_SPEND_USD }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: ./benchmark.sh --ranked
+      - name: Upload trusted aggregate only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: score
+          path: score.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove private fixture
+        if: always()
+        run: rm -f "$DISTILL_PRIVATE_DATASET"

@@ -1,0 +1,178 @@
+You are deciding whether source law A (Eq1: {{ equation1 }}) implies target law B (Eq2: {{ equation2 }}) over all magmas.
+
+A magma is a set with one binary operation `*` and no axioms. Variables are universally quantified. "A implies B" means every magma satisfying A for all assignments also satisfies B for all assignments.
+
+Rules: deterministic classifier. Apply rules in order; stop at the FIRST that fires. Never invent witnesses. If no rule fires, apply the Layer B decision tree at the end.
+
+OUTPUT FORMAT — first write the PARSE block and brief rule trace, then end with EXACTLY these four lines, no markdown, no extra text after COUNTEREXAMPLE:
+VERDICT: TRUE or FALSE
+REASONING: one rule name from {X1 X2 X3 F1 F2 F3 F4 C1 C2 C3 C4 C5 C6 C7 C8 C9 C10 C11 C12 C13 C14 S1 S2 S3 S4 S5 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 H1 H2 H3 H4 H5 H6 B1 B2a B2b B2c}
+PROOF: one short sentence if VERDICT is TRUE, otherwise empty
+COUNTEREXAMPLE: one short sentence if VERDICT is FALSE, otherwise empty
+
+=== STEP 0 — MANDATORY PARSE (write before applying any rule) ===
+
+For EACH of the four sides — A.L, A.R, B.L, B.R — write one PARSE line:
+
+  PARSE <side>: shape=<expr>  vars={...}  occs={v:k,...}  op=<n>  bare=<Y/N>  lm=<v>  rm=<v>  ldepth=<n>  rdepth=<n>
+
+Field definitions (walk the expression as a binary tree; every * is a node):
+  shape   = the side fully parenthesized as written
+  vars    = SET of distinct variable letters on this side
+  occs    = occurrence count of each variable (e.g. {x:2,y:1})
+  op      = count of * symbols on this side
+  bare    = Y iff the side is a single variable letter
+  lm      = leftmost variable letter (walk root → left child → ... to leaf)
+  rm      = rightmost variable letter (walk root → right child → ... to leaf)
+  ldepth  = number of * nodes on left-child path to the leftmost leaf
+  rdepth  = number of * nodes on right-child path to the rightmost leaf
+
+Bare side shorthand: shape=v  vars={v}  occs={v:1}  op=0  bare=Y  lm=v  rm=v  ldepth=0  rdepth=0.
+Worked parse of  x*(y*x):  shape=(x*(y*x))  vars={x,y}  occs={x:2,y:1}  op=2  bare=N  lm=x  rm=x  ldepth=1  rdepth=2.
+
+Do NOT skip Step 0. All downstream rules use only these parsed values.
+
+=== STEP 1 — FEATURES ===
+
+For each expression tree read: leaves left-to-right, leftmost leaf, rightmost leaf.
+left-depth = left-branches on path to leftmost leaf. right-depth = right-branches on path to rightmost leaf.
+Example: x*(y*z) leftmost x left-depth 1, rightmost z right-depth 2. (x*z)*w leftmost x left-depth 2, rightmost w right-depth 1.
+
+For each equation E (sides L, R):
+- vars(E): distinct variable letters in L or R
+- size(E): total variable occurrences; dup(E) = size(E) - vars(E)
+- LP(E): leftmost leaves match. RP(E): rightmost leaves match.
+- SET(E): variable-sets equal. XOR(E): every var same parity both sides. AB(E): every var same count both sides.
+- bare(E): exactly one side is a lone variable (bare), the other a product.
+
+If bare(E), call bare variable x. Define:
+- kind(E) = L (all x-paths left-only) | R (all right-only) | M (any path mixes) | X (x absent from product) | N (not bare)
+- shortest_len(E) = depth of shallowest x on product side (-1 if N)
+- occ(E) = x-occurrences on product side (0 if N)
+
+=== STEP 2 — IDENTITY / COLLAPSE (TRUE) ===
+
+X1: B.L = B.R syntactically -> TRUE.
+X2: A and B same up to consistent renaming, optional side-swap of A -> TRUE.
+X3: A is `x = y` (x != y), OR A has a lone-variable side whose variable is absent from the other side -> TRUE.
+
+=== STEP 3 — FORCED BEHAVIOR ===
+
+F1: A is `x = x*y` (up to renaming/side-swap, x != y) -> forces a*b=a. TRUE iff LP(B); else FALSE.
+F2: A is `x = y*x` (up to renaming/side-swap, x != y) -> forces a*b=b. TRUE iff RP(B); else FALSE.
+F3: Both sides of A are products of two variables; same left child, different right children -> forces a*b=f(a). TRUE iff (leftmost,left-depth) pairs of B.L and B.R match; else FALSE.
+F4: Both sides of A are products of two variables; same right child, different left children -> forces a*b=g(b). TRUE iff (rightmost,right-depth) pairs of B.L and B.R match; else FALSE.
+
+=== STEP 4 — SOURCE CONTRADICTION MOTIFS (TRUE) ===
+
+Apply ONLY when bare(A). Let bare variable = x. Compute for product side of A:
+- rhsVars: distinct variable count. rhsCounts: sorted occurrence counts as digit string.
+  (e.g. {x:1,y:1,z:2}->"112"; {x:1,y:1,z:3}->"113"; {x:2,y:2,z:1}->"122"; {x:2,y:1,z:1,w:1}->"1112")
+- Lx: leftmost is x. Rx: rightmost is x.
+- topShape: top split U*V — "v-m" (U var, V product), "m-v" (U product, V var), "m-m".
+- xTop: "left"(x only in U) | "right"(x only in V) | "both" | "none". xCount: x-occurrences.
+- square: some subterm is u*u.
+
+C1: rhsVars=4 AND Lx=F AND Rx=F -> TRUE
+C2: rhsCounts="113" AND Lx=F AND Rx=F -> TRUE
+C3: Lx=F AND xTop=left AND square=T AND topShape=m-v -> TRUE
+C4: rhsCounts="112" AND Lx=F AND Rx=F AND xTop=right AND topShape=v-m -> TRUE
+C5: rhsCounts="1112" AND Lx=F AND Rx=F AND xTop=right AND topShape=v-m -> TRUE
+C6: rhsVars=3 AND xTop=right AND topShape=v-m AND xCount=2 -> TRUE
+C7: rhsVars=3 AND Lx=F AND Rx=F AND xTop=left AND topShape=m-v AND xCount=2 -> TRUE
+C8: rhsVars=3 AND Lx=T AND xTop=left AND topShape=m-v -> TRUE
+C9: rhsCounts="122" AND Lx=T AND Rx=F AND xTop=both AND topShape=v-m -> TRUE
+C10: rhsCounts="122" AND Lx=F AND Rx=T AND xCount=2 -> TRUE
+C11: rhsCounts="113" AND Lx=F AND Rx=F AND xTop=right AND topShape=v-m -> TRUE
+C12: rhsCounts="113" AND Lx=F AND Rx=F AND xTop=left AND topShape=m-v -> TRUE
+C13: rhsCounts="1112" AND Lx=F AND Rx=T -> TRUE
+C14: bare(B)=T AND rhsCounts="113" AND Rx=T AND square=F -> TRUE
+
+=== STEP 5 — SEPARATORS (FALSE) ===
+
+S1: LP(A) AND NOT LP(B) -> FALSE.
+S2: RP(A) AND NOT RP(B) -> FALSE.
+S3: SET(A) AND NOT SET(B) -> FALSE.
+S4: XOR(A) AND NOT XOR(B) -> FALSE.
+S5: AB(A) AND NOT AB(B) -> FALSE.
+
+=== STEP 6 — AFFINE PROBES (FALSE) ===
+
+u*v = p*u + q*v + c (mod m). eval(var)=var; eval(P*Q) = p*eval(P)+q*eval(Q)+c mod m.
+Equal iff all coefficients AND constant match. For each probe: if A.L!=A.R skip; if A.L=A.R and B.L!=B.R -> FALSE. Run ALL A1-A10.
+
+A1 SHORTCUT: eval_A1(T) = rightmost_leaf(T) + right_depth(T) mod 3.
+IMPORTANT: right_depth counts every right-branch to the actual leaf — go through product nodes (e.g. in x*x the leaf is the right child x, not x*x). Never stop at a product subterm.
+If bare(A) AND Rx=T AND right_depth(product_side) mod 3 = 0: A1 admits A. Compute eval_A1(B.L), eval_A1(B.R). If differ -> FALSE(A1). Else continue.
+
+A7 SHORTCUT: Under A7 (u*v=3u+2v mod 4), leaf at L left- and R right-branches has coef 3^L*2^R mod 4.
+R=0: coef=3^L mod 4 (1 if L even, 3 if L odd). R=1: coef=2. R>=2: coef=0 (skip).
+If bare(A) AND product side = x*(x*Q) (topShape=v-m, Lx=T, left-child-of-right-subtree=x):
+  A7 admits A. Compute eval_A7(B.L), eval_A7(B.R) via R<=1 rule. If differ -> FALSE(A7).
+
+A1:  u*v = v+1      mod 3    A2:  u*v = u+1      mod 3    A3:  u*v = u+v      mod 3
+A4:  u*v = u+2v     mod 3    A5:  u*v = 2u+2v    mod 3    A6:  u*v = 2u+3v    mod 4
+A7:  u*v = 3u+2v    mod 4    A8:  u*v = u+2v     mod 4    A9:  u*v = 2u+v+1   mod 4
+A10: u*v = 3u+3v    mod 5
+
+=== STEP 7 — HEURISTIC REJECTS (FALSE) ===
+
+H1: kind(A)=M AND vars(A)>=4 AND kind(B)=X -> FALSE
+H2: kind(A)=L AND shortest_len(A)=1 AND dup(A)>=3 AND bare(B)=F AND dup(B)>=3 AND vars(B)<=3 -> FALSE
+H3: kind(A)=M AND occ(A)=2 AND NOT RP(A) AND Lx(A)=F -> FALSE
+H4: shortest_len(A)=1 AND occ(A)=3 -> FALSE  [fires regardless of Rx, Lx, or kind]
+H5: kind(A)=M AND shortest_len(A)=3 AND occ(A)=2 -> FALSE
+H6: kind(A)=L AND occ(B)=2 AND vars(B)=4 -> FALSE
+
+=== STEP 8 — LAYER B DECISION TREE (fallback instead of DEFAULT) ===
+
+If no rule above fired, compute three integers about Eq1 ONLY:
+
+M = for each variable v appearing anywhere in Eq1, count its total occurrences across BOTH sides of Eq1. M is the smallest such count. If some variable appears only once, M = 1.
+
+S = number of * symbols on Eq1's LHS. If LHS is a bare variable, S = 0.
+
+V = distinct variable count on Eq1's LHS. If LHS is bare, V = 1.
+
+Apply tree in order:
+
+B1: If M >= 2 -> FALSE. Reason: every variable in Eq1 is constrained in both sides, so Eq1 is too loose to force a tighter Eq2.
+B2a: Else (M = 1) AND S = 0 (Eq1 LHS is a bare variable) -> TRUE. Reason: Eq1 forces the bare variable to equal a product involving a free parameter, which is rigid.
+B2b: Else S = 1 AND V = 2 (Eq1 LHS is x*y with distinct x, y) -> TRUE. Reason: Eq1 is a two-variable product law with rigid LHS.
+B2c: Otherwise -> FALSE. Reason: complex Eq1 LHS with a free parameter is generally too permissive to force Eq2.
+
+=== WORKED EXAMPLES ===
+
+TRUE (F2): A: x=y*x. B: x=x*(x*((y*z)*x)).
+F2 fires. Under a*b=b every term reduces to rightmost leaf. B.L rightmost=x, B.R rightmost=x.
+VERDICT: TRUE
+REASONING: F2
+PROOF: A forces a*b=b, so both sides of B reduce to x.
+COUNTEREXAMPLE:
+
+FALSE (A1): A: x=y*(y*(x*x)). B: x=y*(z*(y*(x*x))).
+A1 shortcut: Rx=T. Trace right_depth of y*(y*(x*x)):
+  root->right->y*(x*x)[1], y*(x*x)->right->x*x[2], x*x->right->x(leaf)[3].
+right_depth=3, 3 mod 3=0. Fires. eval_A1(B.L)=x.
+B.R=y*(z*(y*(x*x))): root->right->z*(y*(x*x))[1]->y*(x*x)[2]->x*x[3]->x(leaf)[4].
+right_depth=4. eval_A1(B.R)=x+4=x+1 (mod 3). x != x+1 -> FALSE(A1).
+VERDICT: FALSE
+REASONING: A1
+PROOF:
+COUNTEREXAMPLE: In Z_3 with u*v=v+1, A holds but B fails.
+
+FALSE (B1): A: x*y = y*x. B: x*(y*z) = (x*y)*z.
+No A/F/C/S/H rule fires. Layer B: variables in A are {x,y} with counts x:2, y:2. M = min(2,2) = 2. B1 fires.
+VERDICT: FALSE
+REASONING: B1
+PROOF:
+COUNTEREXAMPLE: Eq1 (commutativity) does not imply Eq2 (associativity); e.g. Z_3 with u*v = 2u+2v mod 3 satisfies commutativity but not associativity.
+
+TRUE (B2a): A: x = y*(z*x). B: x = (z*y)*x.
+No strict A/F/C/S/H rule fires. Layer B: vars in A are {x,y,z} with counts x:2, y:1, z:1. M = 1. A.LHS is bare x, so S = 0. B2a fires.
+VERDICT: TRUE
+REASONING: B2a
+PROOF: Eq1 has a free parameter and bare LHS; fallback rule B2a applies.
+COUNTEREXAMPLE:
+
+Stop at first firing rule; Layer B provides the final verdict; never invent witnesses.

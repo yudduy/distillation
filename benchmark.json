@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "name": "distillation",
+  "description": "Improve a compact prompt for equational implication across three fixed language models.",
+  "category": "mathematics",
+  "direction": "+",
+  "promotionMode": "automatic",
+  "editablePaths": [
+    "submission/prompt.txt"
+  ],
+  "setupCommand": [
+    "bash",
+    "./setup.sh"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    "./benchmark.sh"
+  ],
+  "scorePath": "score.json",
+  "maxSubmissionBytes": 10240,
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  }
+}
