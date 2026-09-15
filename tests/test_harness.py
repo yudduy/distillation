@@ -17,6 +17,14 @@ from llm import LlmResponse
 TEMPLATE = '{{equation1}} {{ equation2 }}'
 
 
+def uncapped_env(**changes):
+    env={'DISTILL_LIVE':'1','OPENROUTER_API_KEY':'test','DISTILL_ALLOW_UNCAPPED':'1',
+         'GITHUB_ACTIONS':'true','GITHUB_REPOSITORY':'yudduy/distillation',
+         'GITHUB_WORKFLOW_REF':'yudduy/distillation/.github/workflows/benchmark.yml@refs/heads/main'}
+    env.update(changes)
+    return env
+
+
 def response(text='VERDICT: TRUE', **kw):
     return LlmResponse(text=text, finish_reason='stop', **kw)
 
@@ -96,6 +104,64 @@ def test_provider_budget_fail_closed(change):
     with pytest.raises(e.InvalidRun): e.check_key_budget({**data,**change},10)
 
 
+def test_uncapped_mode_is_limited_to_operator_workflow():
+    key, cap = e.live_settings(uncapped_env())
+    assert key == 'test' and cap.is_infinite()
+    for changes in (
+        {'GITHUB_ACTIONS':'false'},
+        {'GITHUB_REPOSITORY':'someone/else'},
+        {'GITHUB_WORKFLOW_REF':'yudduy/distillation/.github/workflows/other.yml@refs/heads/main'},
+    ):
+        with pytest.raises(e.InvalidRun, match='uncapped_hosted_context_invalid'):
+            e.live_settings(uncapped_env(**changes))
+
+
+@pytest.mark.asyncio
+async def test_uncapped_hosted_run_skips_key_cap_but_requires_non_byok_usage(monkeypatch):
+    requests = 0
+    async def handler(req):
+        nonlocal requests
+        if req.url.path.endswith('/key'):
+            # This key metadata would be rejected by ordinary capped mode.
+            return httpx.Response(200, json={'data': {'limit': None, 'limit_remaining': None}})
+        requests += 1
+        body = json.loads(req.content)
+        provider = 'Novita' if body['model'].startswith('google/') else 'DeepInfra'
+        return httpx.Response(200, json={
+            'provider': provider,
+            'usage': {'cost': '0.001', 'prompt_tokens': 1, 'completion_tokens': 1,
+                      'is_byok': False},
+            'choices': [{'finish_reason': 'stop', 'message': {'content': 'VERDICT: TRUE'}}],
+        })
+    monkeypatch.setattr(e, 'base_transport', lambda: httpx.MockTransport(handler))
+    result = await e.live_evaluate(
+        [{'equation1':'a','equation2':'b','answer':True}], TEMPLATE, uncapped_env())
+    assert result['score'] == 1 and requests == 3
+    assert result['metrics']['billing']['confirmedSpendUsd'] == '0.003'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('is_byok', [True, None])
+async def test_uncapped_hosted_run_rejects_byok_or_unreported_billing(monkeypatch, is_byok):
+    async def handler(req):
+        if req.url.path.endswith('/key'):
+            return httpx.Response(200, json={'data': {}})
+        body = json.loads(req.content)
+        provider = 'Novita' if body['model'].startswith('google/') else 'DeepInfra'
+        usage = {'cost': '0.001', 'prompt_tokens': 1, 'completion_tokens': 1}
+        if is_byok is not None:
+            usage['is_byok'] = is_byok
+        return httpx.Response(200, json={
+            'provider': provider,
+            'usage': usage,
+            'choices': [{'finish_reason': 'stop', 'message': {'content': 'VERDICT: TRUE'}}],
+        })
+    monkeypatch.setattr(e, 'base_transport', lambda: httpx.MockTransport(handler))
+    with pytest.raises(e.InvalidRun, match='hosted_billing_mode_invalid'):
+        await e.live_evaluate(
+            [{'equation1':'a','equation2':'b','answer':True}], TEMPLATE, uncapped_env())
+
+
 @pytest.mark.asyncio
 async def test_real_client_routing_and_8192_cap(monkeypatch):
     requests=[]
@@ -115,16 +181,20 @@ async def test_real_client_routing_and_8192_cap(monkeypatch):
         assert r['provider']['allow_fallbacks'] is False
         assert r['provider']['require_parameters'] is True
         assert r['provider']['data_collection']=='deny' and r['provider']['zdr'] is True
+        assert r['provider']['max_price']['request']==0
         assert len(r['messages'])==1 and r['messages'][0]['role']=='user'
     by_model={r['model']:r for r in requests}
-    assert by_model['openai/gpt-oss-120b']['provider']['order']==['deepinfra/bf16']
+    assert by_model['openai/gpt-oss-120b']['provider']['order']==['deepinfra/turbo']
     assert by_model['openai/gpt-oss-120b']['provider']['quantizations']==['bf16']
+    assert by_model['openai/gpt-oss-120b']['provider']['max_price']=={'prompt':.15,'completion':.6,'request':0}
     assert by_model['openai/gpt-oss-120b']['reasoning']=={'effort':'low'}
     assert by_model['meta-llama/llama-3.3-70b-instruct']['provider']['order']==['deepinfra/turbo']
     assert by_model['meta-llama/llama-3.3-70b-instruct']['provider']['quantizations']==['fp8']
+    assert by_model['meta-llama/llama-3.3-70b-instruct']['provider']['max_price']=={'prompt':.1,'completion':.32,'request':0}
     assert 'reasoning' not in by_model['meta-llama/llama-3.3-70b-instruct']
     assert by_model['google/gemma-4-31b-it']['provider']['order']==['novita/bf16']
     assert by_model['google/gemma-4-31b-it']['provider']['quantizations']==['bf16']
+    assert by_model['google/gemma-4-31b-it']['provider']['max_price']=={'prompt':.14,'completion':.4,'request':0}
     assert by_model['google/gemma-4-31b-it']['reasoning']=={'effort':'none'}
     billing=result['metrics']['billing']
     assert {key:billing[key] for key in ('attempts','confirmedSpendUsd','unresolvedReservedUsd')}=={
@@ -283,7 +353,7 @@ async def test_private_receipts_are_sanitized_and_aggregated(tmp_path, monkeypat
     assert len(rows)==3
     assert len({row['attemptId'] for row in rows})==3
     assert len({row['reservationId'] for row in rows})==3
-    assert {row['endpoint'] for row in rows}=={'deepinfra/bf16','deepinfra/turbo','novita/bf16'}
+    assert {row['endpoint'] for row in rows}=={'deepinfra/turbo','novita/bf16'}
     assert all(row['httpStatus']==200 and row['outcome']=='completed' for row in rows)
     assert all((row['tokensIn'],row['tokensOut'],row['reasoningTokens'],row['cachedTokens'],row['isByok'])==(17,9,4,3,False) for row in rows)
     assert all(row['actualCostUsd']=='0.002' and row['unresolvedReservationUsd']=='0' for row in rows)
@@ -391,6 +461,27 @@ async def test_gzip_response_is_decoded_once():
         assert result.json() == payload
         assert 'content-encoding' not in result.headers
     assert ledger.metrics()['attempts'] == 1
+
+
+@pytest.mark.asyncio
+async def test_model_queues_respect_route_caps_without_consuming_call_timeout():
+    active = {alias: 0 for alias in e.MODEL_IDS}
+    peak = {alias: 0 for alias in e.MODEL_IDS}
+    async def complete(alias, _prompt):
+        active[alias] += 1
+        peak[alias] = max(peak[alias], active[alias])
+        try:
+            await asyncio.sleep(.02)
+            return response()
+        finally:
+            active[alias] -= 1
+    rows = [{'equation1':str(i),'equation2':'x=x','answer':True} for i in range(8)]
+    result = await e.evaluate(rows, TEMPLATE, complete, timeout=.03, concurrency=6,
+                              model_concurrency=e.MODEL_CONCURRENCY)
+    assert result['metrics']['outcomes'] == 24
+    assert peak['gpt-oss-120b'] == 1
+    assert 1 <= peak['llama-3-3-70b-instruct'] <= 3
+    assert 1 <= peak['gemma-4-31b-it'] <= 6
 
 
 @pytest.mark.asyncio

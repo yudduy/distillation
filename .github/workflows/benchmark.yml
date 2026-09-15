@@ -36,6 +36,7 @@ jobs:
         env:
           DISTILL_LIVE: ${{ vars.DISTILL_LIVE }}
           DISTILL_MAX_SPEND_USD: ${{ vars.DISTILL_MAX_SPEND_USD }}
+          DISTILL_ALLOW_UNCAPPED: ${{ vars.DISTILL_ALLOW_UNCAPPED }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: ./benchmark.sh --ranked
       - name: Upload trusted aggregate only

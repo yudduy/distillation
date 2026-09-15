@@ -26,11 +26,13 @@ from llm import call_llm
 from models import load_models, resolve
 from prompt import render_prompt
 
-CONTRACT = 'distill-v1'
+CONTRACT = 'distill-v2'
 MAX_BYTES = 10240
 MODEL_IDS = ('gpt-oss-120b', 'llama-3-3-70b-instruct', 'gemma-4-31b-it')
+MODEL_CONCURRENCY = dict(zip(MODEL_IDS, (1, 3, 6), strict=True))
 MAX_ATTEMPTS_PER_PAIR = 24
 MAX_RESPONSE_BYTES = 4_000_000
+HOSTED_REPOSITORY = 'yudduy/distillation'
 
 
 @dataclass(frozen=True)
@@ -56,8 +58,8 @@ class Route:
 
 
 ROUTES = {
-    'gpt-oss-120b': Route('openai/gpt-oss-120b', 'deepinfra/bf16', 'deepinfra', 'bf16', 'low',
-                           Decimal('0.000000037'), Decimal('0.00000017')),
+    'gpt-oss-120b': Route('openai/gpt-oss-120b', 'deepinfra/turbo', 'deepinfra', 'bf16', 'low',
+                           Decimal('0.00000015'), Decimal('0.00000060')),
     'llama-3-3-70b-instruct': Route('meta-llama/llama-3.3-70b-instruct', 'deepinfra/turbo', 'deepinfra', 'fp8', None,
                                            Decimal('0.00000010'), Decimal('0.00000032')),
     'gemma-4-31b-it': Route('google/gemma-4-31b-it', 'novita/bf16', 'novita', 'bf16', 'none',
@@ -197,6 +199,10 @@ def live_settings(env):
     if env.get('DISTILL_LIVE') != '1':
         raise InvalidRun('live_calls_disabled')
     key = env.get('OPENROUTER_API_KEY', '')
+    if uncapped_hosted_mode(env):
+        if not key:
+            raise InvalidRun('credentials_or_spending_cap_missing')
+        return key, Decimal('Infinity')
     try:
         cap = Decimal(env.get('DISTILL_MAX_SPEND_USD', ''))
     except InvalidOperation:
@@ -204,6 +210,17 @@ def live_settings(env):
     if not key or not cap.is_finite() or cap <= 0:
         raise InvalidRun('credentials_or_spending_cap_missing')
     return key, cap
+
+
+def uncapped_hosted_mode(env) -> bool:
+    """Allow an unlimited key only in the protected operator workflow."""
+    if env.get('DISTILL_ALLOW_UNCAPPED') != '1':
+        return False
+    workflow_prefix = f'{HOSTED_REPOSITORY}/.github/workflows/benchmark.yml@'
+    if (env.get('GITHUB_ACTIONS') != 'true' or env.get('GITHUB_REPOSITORY') != HOSTED_REPOSITORY
+            or not env.get('GITHUB_WORKFLOW_REF', '').startswith(workflow_prefix)):
+        raise InvalidRun('uncapped_hosted_context_invalid')
+    return True
 
 
 def check_key_budget(data, cap):
@@ -382,10 +399,11 @@ class GuardedTransport(httpx.AsyncBaseTransport):
     """Normalize and validate the final wire body, then account every POST."""
 
     def __init__(self, inner: httpx.AsyncBaseTransport, ledger: BudgetLedger,
-                 receipts: PrivateReceipts | None = None):
+                 receipts: PrivateReceipts | None = None, reject_byok: bool = False):
         self.inner = inner
         self.ledger = ledger
         self.receipts = receipts
+        self.reject_byok = reject_byok
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.method != 'POST':
@@ -407,7 +425,16 @@ class GuardedTransport(httpx.AsyncBaseTransport):
                 body.pop('reasoning', None)
             elif body.get('reasoning') != {'effort': route.reasoning}:
                 raise InvalidRun('request_config_mismatch')
-            provider.update({'require_parameters': True, 'data_collection': 'deny', 'zdr': True})
+            provider.update({
+                'require_parameters': True,
+                'data_collection': 'deny',
+                'zdr': True,
+                'max_price': {
+                    'prompt': float(route.input_usd_per_token * 1_000_000),
+                    'completion': float(route.output_usd_per_token * 1_000_000),
+                    'request': 0,
+                },
+            })
             if set(body) != {'model', 'messages', 'max_tokens', 'temperature', 'seed', 'provider'} | ({'reasoning'} if route.reasoning else set()):
                 raise InvalidRun('request_config_mismatch')
         except (KeyError, TypeError, StopIteration, json.JSONDecodeError):
@@ -461,6 +488,10 @@ class GuardedTransport(httpx.AsyncBaseTransport):
                     raise InvalidRun('provider_usage_out_of_bounds')
         except (AttributeError, json.JSONDecodeError):
             usage = None
+        if self.reject_byok and 200 <= status < 300 and (usage is None or usage.get('is_byok') is not False):
+            await self.ledger.finish(reservation, status=status, elapsed_ms=elapsed_ms, usage=usage,
+                                     outcome='hosted_billing_mode_invalid', receipts=self.receipts)
+            raise InvalidRun('hosted_billing_mode_invalid')
         await self.ledger.finish(reservation, status=status, elapsed_ms=elapsed_ms, usage=usage,
                                  outcome='completed' if 200 <= status < 300 else 'http_error', receipts=self.receipts)
         # aread() has already decoded gzip/deflate; do not decode it again.
@@ -474,17 +505,32 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         await self.inner.aclose()
 
 
-async def evaluate(rows, template, complete, *, timeout=600, concurrency=6, drain_errors=False):
+async def evaluate(rows, template, complete, *, timeout=600, concurrency=6, drain_errors=False,
+                   model_concurrency=None):
     if type(concurrency) is not int or not 1 <= concurrency <= 600:
         raise InvalidRun('invalid_concurrency')
     semaphore = asyncio.Semaphore(concurrency)
-    async def one(alias, row):
+    model_semaphores = None
+    if model_concurrency is not None:
+        if (set(model_concurrency) != set(MODEL_IDS)
+                or any(type(limit) is not int or limit <= 0 for limit in model_concurrency.values())):
+            raise InvalidRun('invalid_model_concurrency')
+        model_semaphores = {alias: asyncio.Semaphore(model_concurrency[alias]) for alias in MODEL_IDS}
+    async def invoke(alias, prompt):
         async with semaphore:
-            response = await asyncio.wait_for(complete(alias, render_prompt(template, row['equation1'], row['equation2'])), timeout)
-            if response.finish_reason not in ('stop', 'length', 'content_filter'):
-                raise InvalidRun('provider_response_invalid')
-            correct, _ = judge_response(response.text if not response.refusal else '', row['answer'])
-            return alias, correct, response.tokens_in or 0, response.tokens_out or 0
+            # Admission queues are outside the per-attempt provider deadline.
+            return await asyncio.wait_for(complete(alias, prompt), timeout)
+    async def one(alias, row):
+        prompt = render_prompt(template, row['equation1'], row['equation2'])
+        if model_semaphores is None:
+            response = await invoke(alias, prompt)
+        else:
+            async with model_semaphores[alias]:
+                response = await invoke(alias, prompt)
+        if response.finish_reason not in ('stop', 'length', 'content_filter'):
+            raise InvalidRun('provider_response_invalid')
+        correct, _ = judge_response(response.text if not response.refusal else '', row['answer'])
+        return alias, correct, response.tokens_in or 0, response.tokens_out or 0
     tasks = [asyncio.create_task(one(alias, row)) for row in rows for alias in MODEL_IDS]
     try:
         outcomes = await asyncio.gather(*tasks, return_exceptions=drain_errors)
@@ -512,17 +558,19 @@ async def evaluate(rows, template, complete, *, timeout=600, concurrency=6, drai
 
 async def live_evaluate(rows, template, env):
     key, cap = live_settings(env)
+    uncapped = uncapped_hosted_mode(env)
     configs = load_models(VENDOR / 'evaluation_models.json')
     if set(configs) != set(MODEL_IDS):
         raise InvalidRun('model_config_mismatch')
     ledger = BudgetLedger(cap)
     receipts = private_receipts(env)
-    transport = GuardedTransport(base_transport(), ledger, receipts)
+    transport = GuardedTransport(base_transport(), ledger, receipts, reject_byok=uncapped)
     try:
         async with httpx.AsyncClient(transport=transport, timeout=180, trust_env=False, follow_redirects=False) as client:
             response = await client.get('https://openrouter.ai/api/v1/key', headers={'Authorization': f'Bearer {key}'})
             response.raise_for_status()
-            check_key_budget(response.json()['data'], cap)
+            if not uncapped:
+                check_key_budget(response.json()['data'], cap)
             async def complete(alias, prompt_text):
                 entry = configs[alias]
                 name, provider, kwargs = resolve(entry, api_keys=[key])
@@ -533,7 +581,7 @@ async def live_evaluate(rows, template, env):
                 if (response.actual_provider or '').lower().split('/')[0] != expected:
                     raise InvalidRun('provider_route_mismatch')
                 return response
-            result = await evaluate(rows, template, complete)
+            result = await evaluate(rows, template, complete, model_concurrency=MODEL_CONCURRENCY)
             result['metrics']['billing'] = ledger.metrics()
             return result
     finally:

@@ -12,6 +12,8 @@ import urllib.request
 
 SOURCE_SHA = '1aec8a7acf223b7c56e4830977b6e90d4ef1924b'
 SAIR_SHA = 'cf2e964ae911e21421bc9dbf7e28cc8df7291983'
+CONTRACT_VERSION = 'distill-v2'
+DATASET_VERSION = 'yukon-equational-v1'
 ROOT = Path(__file__).resolve().parent
 
 
@@ -127,7 +129,7 @@ def main():
     write_private(target / 'selection.seed', seed)
     write_private(target / 'ranked.jsonl', data)
     write_private(target / 'provenance.json', json.dumps({'sourceSha': SOURCE_SHA, 'excludedDatasetSha': SAIR_SHA, 'checksums': checksums, 'excludedPairs': len(excluded)}, indent=2).encode())
-    manifest = {'contractVersion': 'distill-v1', 'version': 'yukon-equational-v1', 'sha256': hashlib.sha256(data).hexdigest()}
+    manifest = {'contractVersion': CONTRACT_VERSION, 'version': DATASET_VERSION, 'sha256': hashlib.sha256(data).hexdigest()}
     write_private(target / 'ranked-dataset.json', (json.dumps(manifest,indent=2)+'\n').encode())
     print(json.dumps(manifest))  # Only public identity; never print the selection or seed.
 

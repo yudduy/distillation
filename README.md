@@ -19,8 +19,12 @@ requires `DISTILL_LIVE=1`, `OPENROUTER_API_KEY`, and a finite positive
 `DISTILL_MAX_SPEND_USD`. Use a dedicated OpenRouter key with a **non-resetting
 lifetime credit limit at or below that cap**, including BYOK usage in the limit.
 Unlimited, resetting, or larger-cap keys are rejected before inference.
+The protected operator workflow may explicitly set `DISTILL_ALLOW_UNCAPPED=1`
+to use an unlimited key for an operator-authorized evaluation. The evaluator
+accepts this only on `yudduy/distillation` through its benchmark workflow;
+local runs cannot select the exception.
 Do not paste credentials into notes, prompts, shell arguments, or agent chats.
-An agent must obtain approval for the exact model/provider routes and spend cap
+An agent must obtain approval for the exact model/provider routes and spending authorization
 before making paid calls. Setup and tests do not invoke models.
 
 Run `yukon submit`, then inspect `yukon submissions`. Public scores use 20 public
@@ -30,25 +34,27 @@ baseline; equal scores do not replace it. Your notes can describe your method an
 the model you used to author the prompt; those author credits are separate from
 the three models being evaluated.
 
-## Frozen v1 contract
+## Frozen v2 contract
 
 | Model | OpenRouter route | Reasoning |
 | --- | --- | --- |
-| `openai/gpt-oss-120b` | DeepInfra, bf16 | low |
-| `meta-llama/llama-3.3-70b-instruct` | DeepInfra, fp8 | disabled |
+| `openai/gpt-oss-120b` | DeepInfra turbo, bf16 | low |
+| `meta-llama/llama-3.3-70b-instruct` | DeepInfra turbo, fp8 | disabled |
 | `google/gemma-4-31b-it` | Novita, bf16 | disabled |
 
 All use temperature 0, seed 0, 8,192 output tokens, no fallback providers, and
 one complete user prompt per question. Preserve the pinned upstream retry behavior,
 including one retry of an empty non-refusal response; every attempt remains under
-the token cap. Each model/question has a ten-minute outer deadline. There are six
-concurrent requests, one ranked workflow at a time, and a six-hour job ceiling.
+the token cap. Each model/question has a ten-minute provider-call deadline after
+queue admission. There are six requests globally, capped at 1 GPT, 3 Llama, and
+6 Gemma calls at once, one ranked workflow at a time, and a six-hour job ceiling.
 A seed and zero temperature do not guarantee bit-for-bit provider reproducibility.
 
-The trusted adapter sends exact endpoint tags `deepinfra/bf16`,
-`deepinfra/turbo`, and `novita/bf16`; it omits the unsupported reasoning field
-only for Llama. Before each HTTP attempt it reserves a conservative uncached
-input/output ceiling against the local run cap and permits at most 24 attempts
+The trusted adapter sends exact endpoint tag `deepinfra/turbo` for GPT and
+Llama, and `novita/bf16` for Gemma; it omits the unsupported reasoning field
+only for Llama. It also sends route-specific maximum input/output prices.
+Before each HTTP attempt it reserves a conservative uncached
+input/output ceiling against the finite local run cap when configured and permits at most 24 attempts
 per model/prompt. Reported costs reconcile reservations; missing or invalid cost
 data remains fully reserved and can stop further admission.
 
@@ -97,11 +103,14 @@ within one marker type the last occurrence wins. See the upstream README for det
    `ranked.jsonl` bytes into the GitHub `ranked` environment's
    `DISTILL_PRIVATE_DATA_GZIP_BASE64` secret. Confirm the compressed payload fits
    GitHub's secret size limit; never put it in repository files or workflow artifacts.
-5. Set `ranked` environment secret `OPENROUTER_API_KEY` and variables
-   `DISTILL_LIVE=1` and `DISTILL_MAX_SPEND_USD` only after funding approval.
-   The provider key's non-resetting credit limit is the campaign's enforced ceiling;
-   exhaustion stops scoring. Replenishment is a new funding decision, not an
-   automatic retry. See https://openrouter.ai/docs/api_reference/limits.
+5. Set `ranked` environment secret `OPENROUTER_API_KEY` and variable
+   `DISTILL_LIVE=1` only after funding approval. For ordinary capped runs, also set
+   `DISTILL_MAX_SPEND_USD`.
+   Normally the provider key's non-resetting credit limit is the campaign ceiling.
+   For an explicitly authorized uncapped hosted evaluation, set protected variable
+   `DISTILL_ALLOW_UNCAPPED=1`. The evaluator accepts that exception only from the
+   `yudduy/distillation` benchmark workflow. A successful hosted response must
+   explicitly report non-BYOK billing; local emulation fails closed.
 6. Install the Yukon dev GitHub App. Validate the starter prompt through the ranked
    workflow before importing/opening in Yukon dev. Explicitly leave
    `claimedScoreEnabled=false` because local and official datasets differ. The
@@ -117,7 +126,9 @@ It contains aggregate per-model accuracy, parse-failure counts, token counts,
 prompt size/hash, candidate SHA, run ID, and dataset/configuration identities.
 No participant PII or provider credentials belong in this artifact.
 
-`distill-v1` is immutable. Changing the panel, parser, model route, or scoring
+`distill-v2` is immutable. It retains the v1 panel, parser, and generation
+settings while pinning GPT to the working DeepInfra BF16 turbo endpoint.
+Changing the panel, parser, model route, or scoring
 configuration requires a new contract/dataset version and reevaluation before
 scores can be compared. Published aggregate feedback enables adaptation to this
 panel over time; it is a continuous optimization benchmark, not a fresh final test.
