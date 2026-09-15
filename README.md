@@ -52,6 +52,13 @@ input/output ceiling against the local run cap and permits at most 24 attempts
 per model/prompt. Reported costs reconcile reservations; missing or invalid cost
 data remains fully reserved and can stop further admission.
 
+Set `DISTILL_PRIVATE_RECEIPTS` to a new absolute path outside the checkout to
+write one sanitized JSONL record per completion HTTP attempt. The evaluator
+creates it with mode 0600 and refuses existing files. Receipts contain opaque
+attempt/reservation IDs, route, status, elapsed time, token/cost coverage, and
+BYOK status only. They are private ephemeral accounting data and must never be
+uploaded with `score.json`; the ranked workflow removes them during cleanup.
+
 The ranked panel has 100 TRUE and 100 FALSE questions. All three models answer all
 200. `score = correct / 600`, in [0, 1]. Wrong answers, refusals, and unparseable
 completed answers count as incorrect. Valid parseable answers at the token limit

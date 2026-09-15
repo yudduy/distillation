@@ -126,7 +126,13 @@ async def test_real_client_routing_and_8192_cap(monkeypatch):
     assert by_model['google/gemma-4-31b-it']['provider']['order']==['novita/bf16']
     assert by_model['google/gemma-4-31b-it']['provider']['quantizations']==['bf16']
     assert by_model['google/gemma-4-31b-it']['reasoning']=={'effort':'none'}
-    assert result['metrics']['billing']=={'attempts':3,'confirmedSpendUsd':'0.003','unresolvedReservedUsd':'0'}
+    billing=result['metrics']['billing']
+    assert {key:billing[key] for key in ('attempts','confirmedSpendUsd','unresolvedReservedUsd')}=={
+        'attempts':3,'confirmedSpendUsd':'0.003','unresolvedReservedUsd':'0'}
+    for alias in e.MODEL_IDS:
+        assert billing['models'][alias]['attempts']==1
+        assert billing['models'][alias]['costReportedAttempts']==1
+        assert billing['models'][alias]['httpStatusCounts']=={'200':1}
 
 
 @pytest.mark.asyncio
@@ -250,3 +256,153 @@ async def test_attempt_limit_is_per_model_prompt():
         with pytest.raises(e.InvalidRun,match='attempt_limit_exceeded'):
             await client.post('https://openrouter.ai/api/v1/chat/completions',json=body)
     assert calls==e.MAX_ATTEMPTS_PER_PAIR
+
+
+@pytest.mark.asyncio
+async def test_private_receipts_are_sanitized_and_aggregated(tmp_path, monkeypatch):
+    receipts=tmp_path/'attempts.jsonl'
+    async def handler(req):
+        if req.url.path.endswith('/key'):
+            return httpx.Response(200,json={'data':{'limit':1,'limit_remaining':1,'limit_reset':None,'include_byok_in_limit':True}})
+        provider='Novita' if json.loads(req.content)['model'].startswith('google/') else 'DeepInfra'
+        return httpx.Response(200,json={
+            'provider':provider,
+            'usage':{'prompt_tokens':17,'completion_tokens':9,'cost':'0.002',
+                     'is_byok':False,
+                     'prompt_tokens_details':{'cached_tokens':3},
+                     'completion_tokens_details':{'reasoning_tokens':4}},
+            'choices':[{'finish_reason':'stop','message':{'content':'VERDICT: TRUE\nPRIVATE RESPONSE'}}],
+        })
+    monkeypatch.setattr(e, 'base_transport', lambda: httpx.MockTransport(handler))
+    result=await e.live_evaluate(
+        [{'equation1':'PRIVATE EQUATION ONE','equation2':'PRIVATE EQUATION TWO','answer':True}],TEMPLATE,
+        {'DISTILL_LIVE':'1','OPENROUTER_API_KEY':'PRIVATE KEY','DISTILL_MAX_SPEND_USD':'1',
+         'DISTILL_PRIVATE_RECEIPTS':str(receipts)})
+    assert receipts.stat().st_mode & 0o777 == 0o600
+    rows=[json.loads(line) for line in receipts.read_text().splitlines()]
+    assert len(rows)==3
+    assert len({row['attemptId'] for row in rows})==3
+    assert len({row['reservationId'] for row in rows})==3
+    assert {row['endpoint'] for row in rows}=={'deepinfra/bf16','deepinfra/turbo','novita/bf16'}
+    assert all(row['httpStatus']==200 and row['outcome']=='completed' for row in rows)
+    assert all((row['tokensIn'],row['tokensOut'],row['reasoningTokens'],row['cachedTokens'],row['isByok'])==(17,9,4,3,False) for row in rows)
+    assert all(row['actualCostUsd']=='0.002' and row['unresolvedReservationUsd']=='0' for row in rows)
+    serialized=receipts.read_text()
+    assert 'PRIVATE' not in serialized and 'equation' not in serialized.lower()
+    billing=result['metrics']['billing']
+    assert billing['confirmedSpendUsd']=='0.006'
+    public_result=json.dumps(result)
+    assert 'attemptId' not in public_result and 'reservationId' not in public_result and 'PRIVATE' not in public_result
+    for alias in e.MODEL_IDS:
+        assert billing['models'][alias]['tokensIn']==17
+        assert billing['models'][alias]['tokensOut']==9
+        assert billing['models'][alias]['reasoningTokens']==4
+        assert billing['models'][alias]['cachedTokens']==3
+        assert billing['models'][alias]['isByokReportedAttempts']==1
+        assert billing['models'][alias]['byokAttempts']==0
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_writes_unresolved_receipt(tmp_path):
+    receipts_path=tmp_path/'failures.jsonl'
+    receipts=e.PrivateReceipts(receipts_path)
+    async def handler(req):
+        raise httpx.ConnectError('PRIVATE FAILURE',request=req)
+    ledger=e.BudgetLedger(e.Decimal('10'))
+    transport=e.GuardedTransport(httpx.MockTransport(handler),ledger,receipts)
+    route=e.ROUTES['llama-3-3-70b-instruct']
+    body={'model':route.model,'messages':[{'role':'user','content':'PRIVATE PROMPT'}],
+          'max_tokens':8192,'temperature':0,'seed':0,'reasoning':{'effort':'none'},
+          'provider':{'order':[route.endpoint],'quantizations':['fp8'],'allow_fallbacks':False}}
+    with pytest.raises(httpx.ConnectError):
+        async with httpx.AsyncClient(transport=transport) as client:
+            await client.post('https://openrouter.ai/api/v1/chat/completions',json=body)
+    receipts.close()
+    row=json.loads(receipts_path.read_text())
+    assert row['outcome']=='transport_error' and row['httpStatus'] is None
+    assert row['actualCostUsd'] is None and e.Decimal(row['unresolvedReservationUsd'])>0
+    assert 'PRIVATE' not in receipts_path.read_text()
+    model=ledger.metrics()['models']['llama-3-3-70b-instruct']
+    assert model['failedAttempts']==1 and model['transportFailures']==1
+
+
+def test_private_receipt_path_is_new_and_external(tmp_path):
+    with pytest.raises(e.InvalidRun,match='private_receipts_must_be_external'):
+        e.PrivateReceipts(Path('relative.jsonl'))
+    with pytest.raises(e.InvalidRun,match='private_receipts_must_be_external'):
+        e.PrivateReceipts(e.ROOT/'inside.jsonl')
+    existing=tmp_path/'existing.jsonl'; existing.write_text('old')
+    with pytest.raises(e.InvalidRun,match='private_receipts_unavailable'):
+        e.PrivateReceipts(existing)
+
+
+@pytest.mark.asyncio
+async def test_receipts_distinguish_missing_usage_from_explicit_zero(tmp_path):
+    receipt_path=tmp_path/'coverage.jsonl'
+    receipts=e.PrivateReceipts(receipt_path)
+    calls=0
+    async def handler(req):
+        nonlocal calls
+        calls += 1
+        payload={} if calls==1 else {
+            'usage':{'prompt_tokens':0,'completion_tokens':0,'cost':0,'is_byok':True,
+                     'prompt_tokens_details':{'cached_tokens':0},
+                     'completion_tokens_details':{'reasoning_tokens':0}}}
+        return httpx.Response(200,json=payload)
+    ledger=e.BudgetLedger(e.Decimal('10'))
+    transport=e.GuardedTransport(httpx.MockTransport(handler),ledger,receipts)
+    route=e.ROUTES['gemma-4-31b-it']
+    body={'model':route.model,'messages':[{'role':'user','content':'sensitive'}],
+          'max_tokens':8192,'temperature':0,'seed':0,'reasoning':{'effort':'none'},
+          'provider':{'order':[route.endpoint],'quantizations':['bf16'],'allow_fallbacks':False}}
+    async with httpx.AsyncClient(transport=transport) as client:
+        for _ in range(2):
+            await client.post('https://openrouter.ai/api/v1/chat/completions',json=body)
+    receipts.close()
+    missing,zero=[json.loads(line) for line in receipt_path.read_text().splitlines()]
+    assert (missing['tokensIn'],missing['actualCostUsd'],missing['isByok'])==(None,None,None)
+    assert e.Decimal(missing['unresolvedReservationUsd'])>0
+    assert (zero['tokensIn'],zero['tokensOut'],zero['reasoningTokens'],zero['cachedTokens'])==(0,0,0,0)
+    assert zero['actualCostUsd']=='0' and zero['unresolvedReservationUsd']=='0' and zero['isByok'] is True
+    model=ledger.metrics()['models']['gemma-4-31b-it']
+    assert model['usageReportedAttempts']==1 and model['costReportedAttempts']==1
+    assert model['tokensInReportedAttempts']==1 and model['cachedTokensReportedAttempts']==1
+    assert model['isByokReportedAttempts']==1 and model['byokAttempts']==1
+
+
+@pytest.mark.asyncio
+async def test_gzip_response_is_decoded_once():
+    import gzip
+    payload = {'usage': {'cost': 0.001, 'prompt_tokens': 10, 'completion_tokens': 5},
+               'choices': [{'finish_reason': 'stop', 'message': {'content': 'VERDICT: TRUE'}}]}
+    compressed = gzip.compress(json.dumps(payload).encode())
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield compressed
+    async def handler(request):
+        return httpx.Response(200, headers={'content-encoding': 'gzip', 'content-length': str(len(compressed))}, stream=Stream())
+    ledger = e.BudgetLedger(e.Decimal('1'))
+    route = e.ROUTES['llama-3-3-70b-instruct']
+    body = {'model': route.model, 'messages': [{'role': 'user', 'content': 'x=x'}],
+            'max_tokens': 8192, 'temperature': 0, 'seed': 0,
+            'provider': {'order': [route.endpoint], 'quantizations': ['fp8'], 'allow_fallbacks': False}}
+    async with httpx.AsyncClient(transport=e.GuardedTransport(httpx.MockTransport(handler), ledger)) as client:
+        result = await client.post('https://openrouter.ai/api/v1/chat/completions', json=body)
+        assert result.json() == payload
+        assert 'content-encoding' not in result.headers
+    assert ledger.metrics()['attempts'] == 1
+
+
+@pytest.mark.asyncio
+async def test_research_drain_keeps_other_results_without_partial_score():
+    completed = []
+    async def complete(alias, prompt):
+        if alias == e.MODEL_IDS[0]:
+            raise RuntimeError('upstream unavailable')
+        await asyncio.sleep(0.01)
+        completed.append(alias)
+        return response()
+    with pytest.raises(RuntimeError):
+        await e.evaluate([{'equation1': 'x=x', 'equation2': 'x=x', 'answer': True}], TEMPLATE,
+                         complete, drain_errors=True)
+    assert set(completed) == set(e.MODEL_IDS[1:])

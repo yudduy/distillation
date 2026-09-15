@@ -12,8 +12,10 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / 'vendor/sair'
@@ -83,6 +85,47 @@ logging.disable(logging.CRITICAL)
 
 class InvalidRun(Exception):
     """Only fixed, public error codes may leave this process."""
+
+
+@dataclass(frozen=True)
+class Reservation:
+    attempt_id: str
+    reservation_id: str
+    alias: str
+    amount: Decimal
+
+
+class PrivateReceipts:
+    """Append sanitized attempt receipts to one newly created private file."""
+
+    def __init__(self, path: Path):
+        if (not path.is_absolute() or path.resolve().is_relative_to(ROOT.resolve())
+                or any(parent.is_symlink() for parent in (path, *path.parents))):
+            raise InvalidRun('private_receipts_must_be_external')
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.fchmod(fd, 0o600)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                raise InvalidRun('private_receipts_unavailable')
+        except OSError:
+            raise InvalidRun('private_receipts_unavailable') from None
+        self._file = os.fdopen(fd, 'wb', buffering=0)
+        self._lock = asyncio.Lock()
+
+    async def write(self, receipt: dict) -> None:
+        data = (json.dumps(receipt, allow_nan=False, sort_keys=True, separators=(',', ':')) + '\n').encode()
+        async with self._lock:
+            self._file.write(data)
+            os.fsync(self._file.fileno())
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def private_receipts(env) -> PrivateReceipts | None:
+    value = env.get('DISTILL_PRIVATE_RECEIPTS', '').strip()
+    return PrivateReceipts(Path(value)) if value else None
 
 
 def digest(data: bytes) -> str:
@@ -188,12 +231,23 @@ class BudgetLedger:
         self.confirmed = Decimal(0)
         self.unresolved = Decimal(0)
         self.attempts: dict[str, int] = {}
-        self._next_reservation = 0
-        self._reservations: dict[int, Decimal] = {}
+        self._reservations: dict[str, Reservation] = {}
+        self._models = {
+            alias: {'attempts': 0, 'completed': 0, 'failed': 0, 'transportFailures': 0,
+                    'usageReported': 0, 'costReported': 0, 'tokensIn': 0, 'tokensOut': 0,
+                    'reasoningTokens': 0, 'cachedTokens': 0,
+                    'tokensInReported': 0, 'tokensOutReported': 0,
+                    'reasoningTokensReported': 0, 'cachedTokensReported': 0,
+                    'isByokReported': 0, 'byokAttempts': 0, 'confirmed': Decimal(0),
+                    'unresolved': Decimal(0), 'elapsedTotal': 0.0, 'elapsedMax': 0.0,
+                    'statuses': {}}
+            for alias in ROUTES
+        }
         self._lock = asyncio.Lock()
 
-    async def reserve(self, route: Route, prompt: str) -> int:
+    async def reserve(self, route: Route, prompt: str) -> Reservation:
         pair = digest((route.model + '\0' + prompt).encode())
+        alias = next(alias for alias, candidate in ROUTES.items() if candidate is route)
         async with self._lock:
             count = self.attempts.get(pair, 0)
             if count >= MAX_ATTEMPTS_PER_PAIR:
@@ -202,39 +256,121 @@ class BudgetLedger:
             if self.confirmed + self.unresolved + ceiling > self.cap:
                 raise InvalidRun('local_spending_cap_exceeded')
             self.attempts[pair] = count + 1
-            self._next_reservation += 1
-            token = self._next_reservation
-            self._reservations[token] = ceiling
+            reservation = Reservation(secrets.token_hex(16), secrets.token_hex(16), alias, ceiling)
+            self._reservations[reservation.reservation_id] = reservation
             self.unresolved += ceiling
-            return token
+            model = self._models[alias]
+            model['attempts'] += 1
+            model['unresolved'] += ceiling
+            return reservation
 
-    async def reconcile(self, token: int, cost) -> None:
-        if type(cost) not in (int, float, str):
-            return
-        try:
-            amount = Decimal(str(cost))
-        except InvalidOperation:
-            return
-        if not amount.is_finite() or amount < 0:
-            return
+    async def finish(self, reservation: Reservation, *, status: int | None, elapsed_ms: float,
+                     usage: dict | None, outcome: str, receipts: PrivateReceipts | None) -> None:
+        cost = None if usage is None else usage.get('cost')
+        amount: Decimal | None = None
+        if type(cost) in (int, float, str):
+            try:
+                candidate = Decimal(str(cost))
+                if candidate.is_finite() and candidate >= 0:
+                    amount = candidate
+            except InvalidOperation:
+                pass
+        violation = None
         async with self._lock:
-            reserved = self._reservations.pop(token, None)
-            if reserved is None:
+            current = self._reservations.get(reservation.reservation_id)
+            if current is None:
                 return
-            if amount > reserved:
-                raise InvalidRun('provider_cost_exceeded_reservation')
-            self.unresolved -= reserved
-            self.confirmed += amount
+            model = self._models[reservation.alias]
+            if amount is not None:
+                self._reservations.pop(reservation.reservation_id)
+                self.unresolved -= reservation.amount
+                model['unresolved'] -= reservation.amount
+                self.confirmed += amount
+                model['confirmed'] += amount
+                model['costReported'] += 1
+                if amount > reservation.amount:
+                    violation = 'provider_cost_exceeded_reservation'
             if self.confirmed + self.unresolved > self.cap:
-                raise InvalidRun('local_spending_cap_exceeded')
+                violation = 'local_spending_cap_exceeded'
+            model['elapsedTotal'] += elapsed_ms
+            model['elapsedMax'] = max(model['elapsedMax'], elapsed_ms)
+            model['completed' if outcome == 'completed' else 'failed'] += 1
+            if outcome in ('transport_error', 'cancelled'):
+                model['transportFailures'] += 1
+            if status is not None:
+                key = str(status)
+                model['statuses'][key] = model['statuses'].get(key, 0) + 1
+            if usage is not None:
+                model['usageReported'] += 1
+                for target, reported, source in (
+                    ('tokensIn', 'tokensInReported', 'tokens_in'),
+                    ('tokensOut', 'tokensOutReported', 'tokens_out'),
+                    ('reasoningTokens', 'reasoningTokensReported', 'reasoning_tokens'),
+                    ('cachedTokens', 'cachedTokensReported', 'cached_tokens'),
+                ):
+                    value = usage.get(source)
+                    if value is not None:
+                        model[target] += value
+                        model[reported] += 1
+                if usage.get('is_byok') is not None:
+                    model['isByokReported'] += 1
+                    model['byokAttempts'] += usage['is_byok'] is True
+
+        if receipts is not None:
+            await receipts.write({
+                'attemptId': reservation.attempt_id,
+                'reservationId': reservation.reservation_id,
+                'model': ROUTES[reservation.alias].model,
+                'endpoint': ROUTES[reservation.alias].endpoint,
+                'httpStatus': status,
+                'elapsedMs': round(elapsed_ms, 3),
+                'outcome': outcome,
+                'tokensIn': None if usage is None else usage.get('tokens_in'),
+                'tokensOut': None if usage is None else usage.get('tokens_out'),
+                'reasoningTokens': None if usage is None else usage.get('reasoning_tokens'),
+                'cachedTokens': None if usage is None else usage.get('cached_tokens'),
+                'isByok': None if usage is None else usage.get('is_byok'),
+                'actualCostUsd': None if amount is None else format(amount, 'f'),
+                'unresolvedReservationUsd': format(reservation.amount, 'f') if amount is None else '0',
+            })
+        if violation is not None:
+            raise InvalidRun(violation)
 
     def metrics(self) -> dict:
         def amount(value: Decimal) -> str:
             return '0' if value == 0 else format(value, 'f')
+        models = {}
+        for alias, values in self._models.items():
+            elapsed_total = values['elapsedTotal']
+            models[alias] = {
+                'attempts': values['attempts'],
+                'completedAttempts': values['completed'],
+                'failedAttempts': values['failed'],
+                'transportFailures': values['transportFailures'],
+                'usageReportedAttempts': values['usageReported'],
+                'costReportedAttempts': values['costReported'],
+                'tokensIn': values['tokensIn'],
+                'tokensOut': values['tokensOut'],
+                'reasoningTokens': values['reasoningTokens'],
+                'cachedTokens': values['cachedTokens'],
+                'tokensInReportedAttempts': values['tokensInReported'],
+                'tokensOutReportedAttempts': values['tokensOutReported'],
+                'reasoningTokensReportedAttempts': values['reasoningTokensReported'],
+                'cachedTokensReportedAttempts': values['cachedTokensReported'],
+                'isByokReportedAttempts': values['isByokReported'],
+                'byokAttempts': values['byokAttempts'],
+                'confirmedSpendUsd': amount(values['confirmed']),
+                'unresolvedReservedUsd': amount(values['unresolved']),
+                'elapsedMsTotal': round(elapsed_total, 3),
+                'elapsedMsMean': round(elapsed_total / values['attempts'], 3) if values['attempts'] else 0,
+                'elapsedMsMax': round(values['elapsedMax'], 3),
+                'httpStatusCounts': dict(sorted(values['statuses'].items())),
+            }
         return {
             'attempts': sum(self.attempts.values()),
             'confirmedSpendUsd': amount(self.confirmed),
             'unresolvedReservedUsd': amount(self.unresolved),
+            'models': models,
         }
 
 
@@ -245,9 +381,11 @@ def base_transport() -> httpx.AsyncBaseTransport:
 class GuardedTransport(httpx.AsyncBaseTransport):
     """Normalize and validate the final wire body, then account every POST."""
 
-    def __init__(self, inner: httpx.AsyncBaseTransport, ledger: BudgetLedger):
+    def __init__(self, inner: httpx.AsyncBaseTransport, ledger: BudgetLedger,
+                 receipts: PrivateReceipts | None = None):
         self.inner = inner
         self.ledger = ledger
+        self.receipts = receipts
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.method != 'POST':
@@ -276,35 +414,70 @@ class GuardedTransport(httpx.AsyncBaseTransport):
             raise InvalidRun('request_config_mismatch') from None
 
         reservation = await self.ledger.reserve(route, messages[0]['content'])
+        started = time.monotonic()
         content = json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()
         headers = request.headers.copy()
         headers['Content-Length'] = str(len(content))
         headers['X-OpenRouter-Cache'] = 'false'
         guarded = httpx.Request(request.method, request.url, headers=headers, content=content, extensions=request.extensions)
-        response = await self.inner.handle_async_request(guarded)
-        response_body = await response.aread()
-        if len(response_body) > MAX_RESPONSE_BYTES:
-            raise InvalidRun('provider_response_too_large')
-        cost = None
         try:
-            usage = json.loads(response_body).get('usage') or {}
-            for field, maximum in (('prompt_tokens', route.max_input_tokens), ('completion_tokens', route.max_output_tokens)):
-                value = usage.get(field)
-                if value is not None and (type(value) is not int or not 0 <= value <= maximum):
+            response = await self.inner.handle_async_request(guarded)
+            response_body = await response.aread()
+        except BaseException as exc:
+            outcome = 'cancelled' if isinstance(exc, asyncio.CancelledError) else 'transport_error'
+            await self.ledger.finish(reservation, status=None, elapsed_ms=(time.monotonic() - started) * 1000,
+                                     usage=None, outcome=outcome, receipts=self.receipts)
+            raise
+
+        status = response.status_code
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if len(response_body) > MAX_RESPONSE_BYTES:
+            await self.ledger.finish(reservation, status=status, elapsed_ms=elapsed_ms, usage=None,
+                                     outcome='response_too_large', receipts=self.receipts)
+            raise InvalidRun('provider_response_too_large')
+        usage = None
+        try:
+            raw_usage = json.loads(response_body).get('usage')
+            if raw_usage is not None:
+                usage = {
+                    'tokens_in': raw_usage.get('prompt_tokens'),
+                    'tokens_out': raw_usage.get('completion_tokens'),
+                    'reasoning_tokens': (raw_usage.get('completion_tokens_details') or {}).get('reasoning_tokens'),
+                    'cached_tokens': (raw_usage.get('prompt_tokens_details') or {}).get('cached_tokens'),
+                    'is_byok': raw_usage.get('is_byok'),
+                    'cost': raw_usage.get('cost'),
+                }
+                bounded_usage = (
+                    (usage['tokens_in'], route.max_input_tokens),
+                    (usage['tokens_out'], route.max_output_tokens),
+                    (usage['reasoning_tokens'], route.max_output_tokens),
+                    (usage['cached_tokens'], route.max_input_tokens),
+                )
+                if (any(value is not None and (type(value) is not int or not 0 <= value <= maximum)
+                        for value, maximum in bounded_usage)
+                        or (usage['is_byok'] is not None and type(usage['is_byok']) is not bool)):
+                    await self.ledger.finish(reservation, status=status, elapsed_ms=elapsed_ms, usage=None,
+                                             outcome='usage_out_of_bounds', receipts=self.receipts)
                     raise InvalidRun('provider_usage_out_of_bounds')
-            cost = usage.get('cost')
         except (AttributeError, json.JSONDecodeError):
-            pass
-        await self.ledger.reconcile(reservation, cost)
-        return httpx.Response(response.status_code, headers=response.headers, content=response_body,
+            usage = None
+        await self.ledger.finish(reservation, status=status, elapsed_ms=elapsed_ms, usage=usage,
+                                 outcome='completed' if 200 <= status < 300 else 'http_error', receipts=self.receipts)
+        # aread() has already decoded gzip/deflate; do not decode it again.
+        decoded_headers = response.headers.copy()
+        decoded_headers.pop('content-encoding', None)
+        decoded_headers['content-length'] = str(len(response_body))
+        return httpx.Response(response.status_code, headers=decoded_headers, content=response_body,
                               extensions=response.extensions, request=guarded)
 
     async def aclose(self) -> None:
         await self.inner.aclose()
 
 
-async def evaluate(rows, template, complete, *, timeout=600):
-    semaphore = asyncio.Semaphore(6)
+async def evaluate(rows, template, complete, *, timeout=600, concurrency=6, drain_errors=False):
+    if type(concurrency) is not int or not 1 <= concurrency <= 600:
+        raise InvalidRun('invalid_concurrency')
+    semaphore = asyncio.Semaphore(concurrency)
     async def one(alias, row):
         async with semaphore:
             response = await asyncio.wait_for(complete(alias, render_prompt(template, row['equation1'], row['equation2'])), timeout)
@@ -312,9 +485,12 @@ async def evaluate(rows, template, complete, *, timeout=600):
                 raise InvalidRun('provider_response_invalid')
             correct, _ = judge_response(response.text if not response.refusal else '', row['answer'])
             return alias, correct, response.tokens_in or 0, response.tokens_out or 0
-    tasks = [asyncio.create_task(one(alias, row)) for alias in MODEL_IDS for row in rows]
+    tasks = [asyncio.create_task(one(alias, row)) for row in rows for alias in MODEL_IDS]
     try:
-        outcomes = await asyncio.gather(*tasks)
+        outcomes = await asyncio.gather(*tasks, return_exceptions=drain_errors)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
     except BaseException:
         for task in tasks:
             task.cancel()
@@ -340,24 +516,29 @@ async def live_evaluate(rows, template, env):
     if set(configs) != set(MODEL_IDS):
         raise InvalidRun('model_config_mismatch')
     ledger = BudgetLedger(cap)
-    transport = GuardedTransport(base_transport(), ledger)
-    async with httpx.AsyncClient(transport=transport, timeout=180, trust_env=False, follow_redirects=False) as client:
-        response = await client.get('https://openrouter.ai/api/v1/key', headers={'Authorization': f'Bearer {key}'})
-        response.raise_for_status()
-        check_key_budget(response.json()['data'], cap)
-        async def complete(alias, prompt_text):
-            entry = configs[alias]
-            name, provider, kwargs = resolve(entry, api_keys=[key])
-            provider.preferred_providers = [ROUTES[alias].endpoint]
-            response = await call_llm(client, provider_name=name, provider_config=provider,
-                                      model_id=entry.model_id, prompt=prompt_text, kwargs=kwargs)
-            expected = 'novita' if alias == 'gemma-4-31b-it' else 'deepinfra'
-            if (response.actual_provider or '').lower().split('/')[0] != expected:
-                raise InvalidRun('provider_route_mismatch')
-            return response
-        result = await evaluate(rows, template, complete)
-        result['metrics']['billing'] = ledger.metrics()
-        return result
+    receipts = private_receipts(env)
+    transport = GuardedTransport(base_transport(), ledger, receipts)
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=180, trust_env=False, follow_redirects=False) as client:
+            response = await client.get('https://openrouter.ai/api/v1/key', headers={'Authorization': f'Bearer {key}'})
+            response.raise_for_status()
+            check_key_budget(response.json()['data'], cap)
+            async def complete(alias, prompt_text):
+                entry = configs[alias]
+                name, provider, kwargs = resolve(entry, api_keys=[key])
+                provider.preferred_providers = [ROUTES[alias].endpoint]
+                response = await call_llm(client, provider_name=name, provider_config=provider,
+                                          model_id=entry.model_id, prompt=prompt_text, kwargs=kwargs)
+                expected = 'novita' if alias == 'gemma-4-31b-it' else 'deepinfra'
+                if (response.actual_provider or '').lower().split('/')[0] != expected:
+                    raise InvalidRun('provider_route_mismatch')
+                return response
+            result = await evaluate(rows, template, complete)
+            result['metrics']['billing'] = ledger.metrics()
+            return result
+    finally:
+        if receipts is not None:
+            receipts.close()
 
 
 async def run(args, env=os.environ, evaluator=live_evaluate):
