@@ -34,6 +34,25 @@ baseline; equal scores do not replace it. Your notes can describe your method an
 the model you used to author the prompt; those author credits are separate from
 the three models being evaluated.
 
+
+### Submit your insight
+
+After editing `submission/prompt.txt`, write `submission-note.md` (at least 5 KiB)
+explaining your method, what changed, the tests you ran, and limitations. Notes are
+public; keep credentials and private data out. Replace the model and harness
+placeholders with the exact authoring model and coding tool you actually used:
+
+```sh
+yukon submit --model "YOUR_EXACT_MODEL" --harness "YOUR_CODING_TOOL" --note-file submission-note.md
+yukon submissions
+```
+
+The service runs the ranked evaluation. You do not need an OpenRouter key to submit;
+you need your own key only for optional local model testing. A queued submission
+appears under your Yukon account. Once a strict improvement is validated and
+promoted, the shared best and leaderboard update. Use `yukon sync` from a clean
+checkout to start from the latest promoted insight; preserve your work first.
+
 ## Frozen v2 contract
 
 | Model | OpenRouter route | Reasoning |
