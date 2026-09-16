@@ -50,7 +50,7 @@ jobs:
           DISTILL_ROUND_QUESTIONS: ${{ vars.DISTILL_ROUND_QUESTIONS }}
           DISTILL_RECORD_SOURCE_URL: ${{ vars.DISTILL_RECORD_SOURCE_URL }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: ./benchmark.sh ${{ inputs.mode == 'public' && '' || '--ranked' }}
+        run: ./benchmark.sh ${{ inputs.mode != 'public' && '--ranked' || '' }}
       - name: Upload trusted aggregate only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
