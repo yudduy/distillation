@@ -703,8 +703,13 @@ def hosted_fixture(tmp_path, tmp_path_factory, monkeypatch, rows=None, **env_cha
     private.write_bytes(data)
     (tmp_path / 'ranked-dataset.json').write_text(json.dumps(
         {'contractVersion': e.CONTRACT, 'version': 'yukon-equational-v1', 'sha256': e.digest(data)}))
+    # The hosted workflow exports DISTILL_PRIVATE_RECEIPTS before the offline checks run, so
+    # tests that drive main() would inherit a path whose directory does not exist yet. Pin a
+    # fresh per-test path instead of relying on the inherited environment.
+    receipts = tmp_path_factory.mktemp('receipts') / 'attempts.jsonl'
     return uncapped_env(GITHUB_SHA='a' * 40, GITHUB_RUN_ID='7', GITHUB_RUN_ATTEMPT='1',
-                        DISTILL_PRIVATE_DATASET=str(private), **env_changes)
+                        DISTILL_PRIVATE_DATASET=str(private), DISTILL_PRIVATE_RECEIPTS=str(receipts),
+                        **env_changes)
 
 
 async def hosted_run(tmp_path, tmp_path_factory, monkeypatch, answer, *, ranked=True, record=None, rows=None, **env_changes):
