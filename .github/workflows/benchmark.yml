@@ -37,6 +37,11 @@ jobs:
           DISTILL_LIVE: ${{ vars.DISTILL_LIVE }}
           DISTILL_MAX_SPEND_USD: ${{ vars.DISTILL_MAX_SPEND_USD }}
           DISTILL_ALLOW_UNCAPPED: ${{ vars.DISTILL_ALLOW_UNCAPPED }}
+          DISTILL_SCREEN_MIN_CORRECT: ${{ vars.DISTILL_SCREEN_MIN_CORRECT }}
+          DISTILL_SCREEN_MAX_PARSE_FAILURES: ${{ vars.DISTILL_SCREEN_MAX_PARSE_FAILURES }}
+          DISTILL_STOP_WHEN_IMPOSSIBLE: ${{ vars.DISTILL_STOP_WHEN_IMPOSSIBLE }}
+          DISTILL_ROUND_QUESTIONS: ${{ vars.DISTILL_ROUND_QUESTIONS }}
+          DISTILL_RECORD_SOURCE_URL: ${{ vars.DISTILL_RECORD_SOURCE_URL }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: ./benchmark.sh --ranked
       - name: Upload trusted aggregate only

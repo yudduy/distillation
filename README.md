@@ -28,11 +28,31 @@ An agent must obtain approval for the exact model/provider routes and spending a
 before making paid calls. Setup and tests do not invoke models.
 
 Run `yukon submit`, then inspect `yukon submissions`. Public scores use 20 public
-examples and **are not ranked scores**. Ranked evaluation runs in the operator's
+examples and **are not ranked scores**. A local `yukon run` writes
+`stage: "public_complete"` with the same `metrics.publicPanel` block the hosted
+screen produces (see [Staged ranked evaluation](#staged-ranked-evaluation)), so you
+can check the floor before submitting. Ranked evaluation runs in the operator's
 workflow. Better verified prompts are automatically promoted to the public shared
 baseline; equal scores do not replace it. Your notes can describe your method and
 the model you used to author the prompt; those author credits are separate from
 the three models being evaluated.
+
+### Iterate locally on a dev set
+
+The public 20 are a smoke test, not a dev set. The private panel is a seeded sample
+from Equational Theories at a pinned commit minus every published SAIR problem, and
+you can draw practice sets from the same distribution with an explicit public seed:
+
+```sh
+.venv/bin/python select_dataset.py --public-seed 42 --count 200 --out /absolute/path/dev-42.jsonl
+```
+
+Any non-negative integer seed works; each gives a different balanced set with the same
+SAIR exclusions applied. The private selection uses 32 random bytes, so no public seed
+reproduces it. The file loads through the evaluator's public validator
+(`load_dataset(path, ranked=False)`) and can be scored with your own key through
+`evaluate.evaluate()` or `live_evaluate()` from Python. No model calls occur while
+selecting.
 
 
 ### Submit your insight
@@ -97,6 +117,63 @@ are graded normally. Provider errors, timeouts, missing outcomes, unexpected rou
 and dataset/configuration mismatches fail the run with no score. A stale score is
 removed before evaluation. Only the trusted adapter writes the final aggregate.
 
+## Staged ranked evaluation
+
+One hosted run has two stages inside the same workflow, ledger, and client. Yukon
+sees a single `score.json`; `metrics.stage` says which stage ended the run.
+
+1. **Screen.** The 20 public questions × 3 models (60 calls, about three minutes) run
+   first. The floor is `DISTILL_SCREEN_MIN_CORRECT` = **32/60** correct and at most
+   `DISTILL_SCREEN_MAX_PARSE_FAILURES` = **6** parse failures. A prompt below the floor
+   writes `stage: "screen_failed"`, `score: 0`, `partial: true`, and spends nothing
+   on the private panel. The floor is deliberately loose: it removes broken prompts;
+   it does not order good ones (the public panel mis-ordered the current record).
+2. **Ranked rounds.** The 200 private questions are put in a private random order
+   drawn fresh for each run (never recorded anywhere) and evaluated in
+   `DISTILL_ROUND_QUESTIONS` = **20**-question rounds of 60 outcomes. At each round boundary, with nothing in flight, the run
+   compares `correct so far + outcomes remaining` against the record fetched from the
+   public benchmark row at run start (`DISTILL_RECORD_SOURCE_URL`). When even a perfect
+   finish could not exceed the record, no further round is admitted and the run writes
+   `stage: "ranked_stopped"`, `score: 0`, `partial: true`, and
+   `metrics.stopped = {roundsCleared, roundsTotal, roundQuestions, completedOutcomes,
+   correctSoFar, recordCorrect}`. A survivor of all ten rounds has a complete
+   600-outcome score and `stage: "ranked_complete"`.
+
+`score` is non-zero only for `ranked_complete`. Yukon treats the zero-score sentinels
+as ordinary non-improving results (**rejected**, never *failed*), so `yukon submissions`
+shows them alongside the stage, the public-panel counts, and the rounds cleared.
+Feedback is Ladder-style on purpose: a non-improving submission learns its screen
+count, how many rounds it cleared, and that it did not beat the record; only promoted
+runs publish a full ranked score. Yukon also admits **one submission in flight per
+account**; a second `yukon submit` while one is validating is refused with HTTP 409.
+
+Every stage carries `metrics.publicPanel`: the 20 public problems copied verbatim
+from `vendor/sair/examples/problems_hard3_20.jsonl` (`{id, eq1Id, eq2Id, equation1,
+equation2, expected}`), one 20-character verdict string per model (`1` correct, `0`
+wrong, `u` unparseable, index `i` is `problems[i]`), per-model counts, the screen's
+own token totals, and the floor result. The top-level `outcomes`, `parseFailures`,
+`tokensIn`, and `tokensOut` count the ranked stage only. A local `yukon run` emits the identical block with `stage: "public_complete"`.
+Per-question data exists **only** for the public panel; ranked rows never reach a
+per-question field, and a sentinel `score.json` is never an accuracy.
+
+`metrics.evaluationPolicy` records the floor, the round size, the order policy
+(`shuffleSeed: "private-random"`), whether stopping was on, and the record used (`{source, score, correct}`, or `"unavailable"` when the fetch
+failed, or `"disabled"`). The record fetch is unauthenticated, requires the
+benchmark's `direction` to be `+`, and **fails open**: any error means no stopping
+and one full-price run rather than a wave of failed submissions. Set
+`DISTILL_STOP_WHEN_IMPOSSIBLE=0` to disable stopping entirely. The screen also runs
+before every ranked evaluation and asserts that no public `(eq1_id, eq2_id)` pair
+appears in the private panel; `prepare_private.py` makes the same check at fixture
+load, before any spend.
+
+None of this changes `distill-v2`: generation settings, routes, the parser, the dataset
+pin, and complete-run scoring are unchanged, and `configSha256` /
+`executionConfigSha256` are byte-identical across all four stages. The policy lives
+only in `metrics.evaluationPolicy` and `metrics.publicPanel`. `benchmark.json` sets
+`minScoreImprovementBips: 125` (about six outcomes at the current record) because
+600 outcomes over 200 questions carry a sampling error near 1.7 pp; a promotion must
+clear the noise floor, not just one outcome.
+
 The model configurations and parser come from SAIR's Apache-2.0 judge at
 `fe00cf9e9080dba6634882c9316b73d536c4fe60`. `vendor/sair/` contains unchanged source,
 examples, license, and tests; `SHA256SUMS.json` checks their bytes. The verdict parser
@@ -130,7 +207,14 @@ within one marker type the last occurrence wins. See the upstream README for det
    GitHub's secret size limit; never put it in repository files or workflow artifacts.
 5. Set `ranked` environment secret `OPENROUTER_API_KEY` and variable
    `DISTILL_LIVE=1` only after funding approval. For ordinary capped runs, also set
-   `DISTILL_MAX_SPEND_USD`.
+   `DISTILL_MAX_SPEND_USD`; allow about $0.10 more than a bare ranked run for the
+   60 screen calls. All of these, and the staged-evaluation variables below, live in
+   the GitHub **environment** named `ranked` (the workflow declares
+   `environment: ranked`), not at repository level. Set `DISTILL_RECORD_SOURCE_URL`
+   to the public benchmark row, `https://<yukon-api>/api/benchmarks/<benchmark-id>`,
+   so stopping can fire; its `direction` must be `+`. `DISTILL_SCREEN_MIN_CORRECT`,
+   `DISTILL_SCREEN_MAX_PARSE_FAILURES`, `DISTILL_STOP_WHEN_IMPOSSIBLE`, and
+   `DISTILL_ROUND_QUESTIONS` are optional and default to 32, 6, on, and 20.
    Normally the provider key's non-resetting credit limit is the campaign ceiling.
    For an explicitly authorized uncapped hosted evaluation, set protected variable
    `DISTILL_ALLOW_UNCAPPED=1`. The evaluator accepts that exception only from the
@@ -145,11 +229,16 @@ within one marker type the last occurrence wins. See the upstream README for det
    Obtain challenge-specific legal copy before public launch. Exercise submit,
    validation, rejection, and promotion in dev before any production rollout.
 
-Do not publish partial results or logs containing questions, expected labels,
-responses, private paths, or raw HTTP error bodies. Only `score.json` and the
-sanitized `evaluation-costs.json` accounting artifact are uploaded. The score contains
-aggregate per-model accuracy, parse-failure counts, token counts,
-prompt size/hash, candidate SHA, run ID, and dataset/configuration identities.
+Do not publish logs containing private questions, expected labels, responses,
+private paths, or raw HTTP error bodies. Only `score.json` and the sanitized
+`evaluation-costs.json` accounting artifact are uploaded. The score contains
+aggregate per-model accuracy, parse-failure counts, token counts, prompt size/hash,
+candidate SHA, run ID, dataset/configuration identities, the stage, the public-panel
+block, the evaluation policy, and, for a stopped run, the round counts. The only
+per-question data it ever carries is the public 20-question panel. A sentinel
+(`screen_failed`, `ranked_stopped`) is a zero score with `partial: true`, never an
+accuracy, and never ranked per-question data. `evaluation-costs.json` reports
+`status` as `succeeded`, `screen_failed`, `stopped`, or `failed`.
 No participant PII or provider credentials belong in this artifact.
 
 `distill-v2` is immutable. It retains the v1 panel, parser, and generation

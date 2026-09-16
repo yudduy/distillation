@@ -3,7 +3,7 @@ import base64
 import gzip
 import os
 from pathlib import Path
-from evaluate import load_dataset, ROOT
+from evaluate import SCREEN_DATASET, assert_screen_disjoint, load_dataset, ROOT
 
 
 def main():
@@ -19,7 +19,9 @@ def main():
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as stream:
         stream.write(data)
-    load_dataset(target, ranked=True)
+    rows, _, _ = load_dataset(target, ranked=True)
+    # The public screen must not share a pair with the private panel; fail here, before any spend.
+    assert_screen_disjoint(load_dataset(SCREEN_DATASET, ranked=False)[0], rows)
 
 
 if __name__ == '__main__':

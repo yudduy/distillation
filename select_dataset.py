@@ -48,22 +48,50 @@ def candidates(entries, excluded):
     return eligible(positives), eligible(negatives)
 
 
-def select(entries, excluded, equations, seed):
+def select(entries, excluded, equations, seed, per_class=100, prefix='yukon'):
     if len(seed) != 32:
         raise ValueError('seed must be 32 bytes')
     positive, negative = candidates(entries, excluded)
     rows = []
     for answer, pool in ((True, positive), (False, negative)):
-        if len(pool) < 100:
+        if len(pool) < per_class:
             raise ValueError('insufficient eligible proven pairs')
         def ordering(pair):
             return hmac.new(seed, f'{int(answer)}:{pair[0]}:{pair[1]}'.encode(), hashlib.sha256).digest()
-        for pair in sorted(pool, key=ordering)[:100]:
-            rows.append({'id': f'yukon_{len(rows)+1:04}', 'eq1_id': pair[0], 'eq2_id': pair[1],
+        for pair in sorted(pool, key=ordering)[:per_class]:
+            rows.append({'id': f'{prefix}_{len(rows)+1:04}', 'eq1_id': pair[0], 'eq2_id': pair[1],
                          'equation1': equations[pair[0]], 'equation2': equations[pair[1]],
                          'answer': answer, 'provenance': {**pool[pair], 'sourceSha': SOURCE_SHA}})
     # Interleave classes, avoiding a class-dependent request order across all models.
-    return [row for pair in zip(rows[:100], rows[100:]) for row in pair]
+    return [row for pair in zip(rows[:per_class], rows[per_class:]) for row in pair]
+
+
+def public_seed_bytes(public_seed: int) -> bytes:
+    """Derive a 32-byte selection seed from a public integer.
+
+    The private panel uses 32 random bytes from `secrets`; no public integer reproduces it.
+    """
+    if type(public_seed) is not int or public_seed < 0:
+        raise ValueError('public seed must be a non-negative integer')
+    return hashlib.sha256(b'yukon-public-dev:' + str(public_seed).encode()).digest()
+
+
+def write_public(public_seed: int, count: int, out: Path) -> dict:
+    """Write a public dev set: same source, same SAIR exclusions, balanced, seeded by an integer.
+
+    This never reads the private seed or fixture. It is a practice distribution for local
+    iteration, not the ranked panel; ranked scores come only from the operator workflow.
+    """
+    if type(count) is not int or count < 2 or count % 2:
+        raise ValueError('count must be an even integer of at least 2')
+    entries, excluded, equations, _ = sources()
+    rows = select(entries, excluded, equations, public_seed_bytes(public_seed), per_class=count // 2, prefix='dev')
+    data = b''.join((json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n').encode() for row in rows)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, 'xb') as stream:
+        stream.write(data)
+    return {'datasetKind': 'public-dev', 'publicSeed': public_seed, 'count': count, 'sha256': hashlib.sha256(data).hexdigest()}
 
 
 def fetch(url):
@@ -115,9 +143,25 @@ def write_private(path, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--seed-file', type=Path, help='Reuse an existing private 32-byte seed')
+    private = parser.add_argument_group('private ranked selection (operator only)')
+    private.add_argument('--output-dir', type=Path)
+    private.add_argument('--seed-file', type=Path, help='Reuse an existing private 32-byte seed')
+    public = parser.add_argument_group('public dev set (anyone; same source and exclusions, never the private seed)')
+    public.add_argument('--public-seed', type=int, help='Explicit integer seed; required for a dev set')
+    public.add_argument('--count', type=int, default=200, help='Even number of questions, half TRUE half FALSE')
+    public.add_argument('--out', type=Path, help='New JSONL path for the dev set')
     args = parser.parse_args()
+    if args.out is not None or args.public_seed is not None:
+        if args.output_dir is not None or args.seed_file is not None:
+            parser.error('--public-seed/--out cannot be combined with --output-dir/--seed-file')
+        if args.public_seed is None:
+            parser.error('a public dev set requires an explicit --public-seed')
+        if args.out is None:
+            parser.error('--out is required with --public-seed')
+        print(json.dumps(write_public(args.public_seed, args.count, args.out)))
+        return
+    if args.output_dir is None:
+        parser.error('--output-dir is required for a private selection')
     target = external(args.output_dir)
     if target.exists():
         raise ValueError('output directory must be new; never overwrite a frozen selection')

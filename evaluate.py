@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -11,6 +12,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import stat
@@ -33,6 +35,14 @@ MODEL_CONCURRENCY = dict(zip(MODEL_IDS, (1, 3, 6), strict=True))
 MAX_ATTEMPTS_PER_PAIR = 24
 MAX_RESPONSE_BYTES = 4_000_000
 HOSTED_REPOSITORY = 'yudduy/distillation'
+# Staged evaluation. The public 20-question panel screens a prompt before any private spend; the
+# ranked panel is then evaluated in shuffled rounds and stopped once the record is unreachable.
+SCREEN_DATASET = VENDOR / 'examples/problems_hard3_20.jsonl'
+SCREEN_DEFAULT_MIN_CORRECT = 32
+SCREEN_DEFAULT_MAX_PARSE_FAILURES = 6
+ROUND_DEFAULT_QUESTIONS = 20
+STAGES = ('public_complete', 'screen_failed', 'ranked_stopped', 'ranked_complete')
+RECORD_SOURCE = 'yukon-public-api'
 
 
 @dataclass(frozen=True)
@@ -225,6 +235,80 @@ def uncapped_hosted_mode(env) -> bool:
     if not hosted_workflow(env):
         raise InvalidRun('uncapped_hosted_context_invalid')
     return True
+
+
+def _policy_int(env, name, default, low, high, code):
+    raw = env.get(name, '')
+    raw = raw.strip() if isinstance(raw, str) else raw
+    if raw == '' or raw is None:
+        return default
+    if not isinstance(raw, str) or not re.fullmatch(r'[0-9]+', raw) or not low <= int(raw) <= high:
+        raise InvalidRun(code)
+    return int(raw)
+
+
+def screen_policy(env) -> tuple[int, int]:
+    """Public-panel floor: (minimum correct of 60, maximum parse failures of 60)."""
+    return (_policy_int(env, 'DISTILL_SCREEN_MIN_CORRECT', SCREEN_DEFAULT_MIN_CORRECT, 0, 60, 'screen_policy_invalid'),
+            _policy_int(env, 'DISTILL_SCREEN_MAX_PARSE_FAILURES', SCREEN_DEFAULT_MAX_PARSE_FAILURES, 0, 60, 'screen_policy_invalid'))
+
+
+def stop_policy(env) -> tuple[bool, str | None, int]:
+    """(stop when the record is unreachable, record source URL, questions per round)."""
+    switch = env.get('DISTILL_STOP_WHEN_IMPOSSIBLE', '').strip()
+    if switch not in ('', '0', '1'):
+        raise InvalidRun('stop_policy_invalid')
+    url = env.get('DISTILL_RECORD_SOURCE_URL', '').strip() or None
+    rounds = _policy_int(env, 'DISTILL_ROUND_QUESTIONS', ROUND_DEFAULT_QUESTIONS, 1, 200, 'round_policy_invalid')
+    return switch != '0', url, rounds
+
+
+def record_correct_from_score(score, total=600) -> int | None:
+    """Exact correct count behind a published score, or None when it is not k/total."""
+    if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
+        return None
+    count = round(score * total)
+    return count if abs(count / total - score) < 1e-9 else None
+
+
+def record_transport() -> httpx.AsyncBaseTransport:
+    return httpx.AsyncHTTPTransport(retries=0)
+
+
+async def fetch_record(url) -> dict | None:
+    """Read the public benchmark row's current best. Fails open: any problem means no stopping."""
+    try:
+        if not isinstance(url, str) or not url.startswith('https://'):
+            raise ValueError('record_url')
+        async with httpx.AsyncClient(transport=record_transport(), timeout=20, trust_env=False,
+                                     follow_redirects=False) as client:
+            response = await client.get(url)
+        if response.status_code != 200:
+            raise ValueError('record_status')
+        benchmark = response.json()['benchmark']
+        if benchmark.get('direction') != '+':  # Yukon's enum is "+" | "-"; anything else fails open.
+            raise ValueError('record_direction')
+        score = benchmark['currentBestScore']
+        correct = record_correct_from_score(score)
+        if correct is None:
+            raise ValueError('record_score')
+        return {'source': RECORD_SOURCE, 'score': score, 'correct': correct}
+    except Exception:
+        # Never surface the body or the exception; an outage costs one full-price run, not a failed one.
+        return None
+
+
+def private_shuffle_seed() -> str:
+    """Fresh per run and never recorded: a reproducible order would let repeated stopped runs
+    accumulate linear constraints on per-question private results."""
+    return secrets.token_hex(16)
+
+
+def assert_screen_disjoint(screen_rows, ranked_rows) -> None:
+    """The public screen and the private ranked panel must not share an equation pair."""
+    pairs = {(row['eq1_id'], row['eq2_id']) for row in screen_rows}
+    if any((row.get('eq1_id'), row.get('eq2_id')) in pairs for row in ranked_rows):
+        raise InvalidRun('screen_panel_overlap')
 
 
 def check_key_budget(data, cap):
@@ -517,58 +601,201 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         await self.inner.aclose()
 
 
+def _aggregate(outcomes, rows, include_verdicts=False) -> dict:
+    """Aggregate completed outcomes. `None` entries are outcomes never produced (stopped run)."""
+    completed = [outcome for outcome in outcomes if outcome is not None]
+    models = {}
+    for alias in MODEL_IDS:
+        results = [outcome for outcome in completed if outcome[0] == alias]
+        correct = sum(outcome[1] is True for outcome in results)
+        models[alias] = {'correct': correct, 'total': len(results),
+                         'accuracy': correct / len(results) if results else 0.0,
+                         'parseFailures': sum(outcome[1] is None for outcome in results)}
+    correct = sum(m['correct'] for m in models.values())
+    result = {'score': correct / len(completed) if completed else 0,
+              'metrics': {'models': models, 'outcomes': len(completed), 'questionCount': len(rows),
+                          'parseFailures': sum(m['parseFailures'] for m in models.values()),
+                          'tokensIn': sum(o[2] for o in completed), 'tokensOut': sum(o[3] for o in completed)}}
+    if include_verdicts:
+        # Question-major job order: outcomes[q * len(MODEL_IDS) + m] is question q, model m.
+        marks = {True: '1', False: '0', None: 'u'}
+        result['metrics']['verdicts'] = {
+            alias: ''.join(marks[outcomes[q * len(MODEL_IDS) + m][1]] for q in range(len(rows)))
+            for m, alias in enumerate(MODEL_IDS)}
+    return result
+
+
+async def _cancel_active(active) -> None:
+    for task in active:
+        task.cancel()
+    await asyncio.gather(*active, return_exceptions=True)
+
+
 async def evaluate(rows, template, complete, *, timeout=600, concurrency=6, drain_errors=False,
-                   model_concurrency=None):
+                   model_concurrency=None, record_correct=None, include_verdicts=False,
+                   shuffle_seed=None, round_questions=None):
     if type(concurrency) is not int or not 1 <= concurrency <= 600:
         raise InvalidRun('invalid_concurrency')
-    semaphore = asyncio.Semaphore(concurrency)
-    model_semaphores = None
     if model_concurrency is not None:
         if (set(model_concurrency) != set(MODEL_IDS)
                 or any(type(limit) is not int or limit <= 0 for limit in model_concurrency.values())):
             raise InvalidRun('invalid_model_concurrency')
-        model_semaphores = {alias: asyncio.Semaphore(model_concurrency[alias]) for alias in MODEL_IDS}
+    staged = record_correct is not None or shuffle_seed is not None or round_questions is not None
+    if staged and model_concurrency is None:
+        raise InvalidRun('invalid_stop_policy')
+    if ((record_correct is not None and (type(record_correct) is not int or record_correct < 0))
+            or (round_questions is not None and (type(round_questions) is not int or round_questions < 1))
+            or (shuffle_seed is not None and not isinstance(shuffle_seed, str))):
+        raise InvalidRun('invalid_stop_policy')
+    if include_verdicts and shuffle_seed is not None:
+        # Verdict strings are indexed by the caller's row order; they exist only for the public panel.
+        raise InvalidRun('invalid_verdict_policy')
+    rows = list(rows)
+    if shuffle_seed is not None:
+        # Per-run order: a fixed private order would make the stopping point a prefix oracle on labels.
+        random.Random(shuffle_seed).shuffle(rows)
     async def invoke(alias, prompt):
-        async with semaphore:
-            # Admission queues are outside the per-attempt provider deadline.
-            return await asyncio.wait_for(complete(alias, prompt), timeout)
+        # Admission queues are outside the per-attempt provider deadline.
+        return await asyncio.wait_for(complete(alias, prompt), timeout)
     async def one(alias, row):
         prompt = render_prompt(template, row['equation1'], row['equation2'])
-        if model_semaphores is None:
-            response = await invoke(alias, prompt)
-        else:
-            async with model_semaphores[alias]:
-                response = await invoke(alias, prompt)
+        response = await invoke(alias, prompt)
         if response.finish_reason not in ('stop', 'length', 'content_filter'):
             raise InvalidRun('provider_response_invalid')
         correct, _ = judge_response(response.text if not response.refusal else '', row['answer'])
         return alias, correct, response.tokens_in or 0, response.tokens_out or 0
-    tasks = [asyncio.create_task(one(alias, row)) for row in rows for alias in MODEL_IDS]
-    try:
-        outcomes = await asyncio.gather(*tasks, return_exceptions=drain_errors)
-        for outcome in outcomes:
-            if isinstance(outcome, BaseException):
-                raise outcome
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    if len(outcomes) != len(rows) * len(MODEL_IDS):
+
+    jobs = [(alias, row) for row in rows for alias in MODEL_IDS]
+    if model_concurrency is None:
+        semaphore = asyncio.Semaphore(concurrency)
+        async def limited(alias, row):
+            async with semaphore:
+                return await one(alias, row)
+        tasks = [asyncio.create_task(limited(alias, row)) for alias, row in jobs]
+        try:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=drain_errors)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+    else:
+        # Admit global and per-model capacity atomically. Nested semaphores can
+        # queue one model ahead of another at the global boundary, leaving a
+        # long capped-model tail even though eligible work remains.
+        pending = {alias: deque() for alias in MODEL_IDS}
+        round_size = (round_questions or len(rows)) * len(MODEL_IDS)
+        rounds = deque(list(enumerate(jobs))[start:start + round_size] for start in range(0, len(jobs), round_size))
+        rounds_total = len(rounds)
+
+        def load_round():
+            for index, (alias, row) in rounds.popleft():
+                pending[alias].append((index, row))
+
+        load_round()
+        active_by_model = {alias: 0 for alias in MODEL_IDS}
+        active = {}
+        outcomes = [None] * len(jobs)
+        completed = correct_so_far = rounds_cleared = 0
+        stopped = False
+
+        def admit():
+            made_progress = True
+            while len(active) < concurrency and made_progress:
+                made_progress = False
+                for alias in MODEL_IDS:
+                    if len(active) >= concurrency:
+                        break
+                    if pending[alias] and active_by_model[alias] < model_concurrency[alias]:
+                        index, row = pending[alias].popleft()
+                        task = asyncio.create_task(one(alias, row))
+                        active[task] = (index, alias)
+                        active_by_model[alias] += 1
+                        made_progress = True
+
+        admit()
+        try:
+            while active:
+                done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                failures = []
+                for task in done:
+                    index, alias = active.pop(task)
+                    active_by_model[alias] -= 1
+                    try:
+                        outcomes[index] = task.result()
+                        completed += 1
+                        correct_so_far += outcomes[index][1] is True
+                    except BaseException as exc:
+                        outcomes[index] = exc
+                        failures.append((index, exc))
+                if failures and not drain_errors:
+                    raise min(failures, key=lambda item: item[0])[1]
+                if not active and not any(pending.values()) and not failures:
+                    # Round boundary: nothing in flight. Stop only when even a perfect finish
+                    # could not exceed the record; a finished panel is always a complete score.
+                    rounds_cleared += 1
+                    remaining = len(jobs) - completed
+                    if record_correct is not None and remaining and correct_so_far + remaining <= record_correct:
+                        stopped = True
+                        break
+                    if rounds:
+                        load_round()
+                admit()
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+            if not stopped and (rounds or any(pending.values())):
+                raise InvalidRun('missing_outcomes')
+        except BaseException:
+            await _cancel_active(active)
+            raise
+        if stopped:
+            result = _aggregate(outcomes, rows)
+            result['score'] = 0
+            result['metrics']['stopped'] = {
+                'roundsCleared': rounds_cleared, 'roundsTotal': rounds_total,
+                'roundQuestions': round_questions or len(rows), 'completedOutcomes': completed,
+                'correctSoFar': correct_so_far, 'recordCorrect': record_correct}
+            return result
+    if any(outcome is None for outcome in outcomes) or len(outcomes) != len(rows) * len(MODEL_IDS):
         raise InvalidRun('missing_outcomes')
-    models = {}
-    for alias in MODEL_IDS:
-        results = [outcome for outcome in outcomes if outcome[0] == alias]
-        correct = sum(outcome[1] is True for outcome in results)
-        models[alias] = {'correct': correct, 'total': len(results), 'accuracy': correct / len(results),
-                         'parseFailures': sum(outcome[1] is None for outcome in results)}
-    return {'score': sum(m['correct'] for m in models.values()) / len(outcomes),
-            'metrics': {'models': models, 'outcomes': len(outcomes), 'questionCount': len(rows),
-                        'parseFailures': sum(m['parseFailures'] for m in models.values()),
-                        'tokensIn': sum(o[2] for o in outcomes), 'tokensOut': sum(o[3] for o in outcomes)}}
+    return _aggregate(outcomes, rows, include_verdicts)
 
 
-async def live_evaluate(rows, template, env):
+@dataclass(frozen=True)
+class ScreenPanel:
+    rows: list
+    sha256: str
+    version: str
+    min_correct: int
+    max_parse_failures: int
+
+
+def public_panel(screen: ScreenPanel, metrics: dict) -> dict:
+    """The public-panel block: verbatim public problems, per-model verdicts, counts and the floor."""
+    models = {alias: dict(metrics['models'][alias]) for alias in MODEL_IDS}
+    correct = sum(m['correct'] for m in models.values())
+    parse_failures = sum(m['parseFailures'] for m in models.values())
+    return {
+        'datasetKind': 'public', 'datasetVersion': screen.version, 'datasetSha256': screen.sha256,
+        'questionCount': len(screen.rows),
+        'problems': [{'id': row['id'], 'eq1Id': row['eq1_id'], 'eq2Id': row['eq2_id'],
+                      'equation1': row['equation1'], 'equation2': row['equation2'], 'expected': row['answer']}
+                     for row in screen.rows],
+        'verdicts': dict(metrics['verdicts']),
+        'models': models,
+        'correct': correct, 'total': sum(m['total'] for m in models.values()), 'parseFailures': parse_failures,
+        'tokensIn': metrics['tokensIn'], 'tokensOut': metrics['tokensOut'],
+        'floor': {'minCorrect': screen.min_correct, 'maxParseFailures': screen.max_parse_failures,
+                  'passed': correct >= screen.min_correct and parse_failures <= screen.max_parse_failures},
+    }
+
+
+async def live_evaluate(rows, template, env, *, screen: ScreenPanel | None = None, record_correct=None,
+                        shuffle_seed=None, round_questions=None, include_verdicts=False):
     key, cap = live_settings(env)
     uncapped = uncapped_hosted_mode(env)
     configs = load_models(VENDOR / 'evaluation_models.json')
@@ -600,9 +827,35 @@ async def live_evaluate(rows, template, env):
                     print(json.dumps({'event': 'evaluation_progress', 'model': alias,
                                       'completed': completed[alias]}), flush=True)
                 return response
-            result = await evaluate(rows, template, complete, model_concurrency=MODEL_CONCURRENCY)
+            panel = None
+            if screen is not None:
+                # Stage one: the public panel, same ledger and client, before any private spend.
+                screened = await evaluate(screen.rows, template, complete, model_concurrency=MODEL_CONCURRENCY,
+                                          include_verdicts=True)
+                panel = public_panel(screen, screened['metrics'])
+                for alias in MODEL_IDS:
+                    completed[alias] = 0
+                if not panel['floor']['passed']:
+                    result = _aggregate([], rows)
+                    result['score'] = 0
+                    result['metrics'].update({'stage': 'screen_failed', 'partial': True, 'publicPanel': panel,
+                                              'billing': ledger.metrics()})
+                    status = 'screen_failed'
+                    return result
+            result = await evaluate(rows, template, complete, model_concurrency=MODEL_CONCURRENCY,
+                                    record_correct=record_correct, shuffle_seed=shuffle_seed,
+                                    round_questions=round_questions, include_verdicts=include_verdicts)
+            if panel is not None:
+                result['metrics']['publicPanel'] = panel
+                if 'stopped' in result['metrics']:
+                    result['metrics'].update({'stage': 'ranked_stopped', 'partial': True})
+                    status = 'stopped'
+                else:
+                    result['metrics']['stage'] = 'ranked_complete'
+                    status = 'succeeded'
+            else:
+                status = 'succeeded'
             result['metrics']['billing'] = ledger.metrics()
-            status = 'succeeded'
             return result
     finally:
         if receipts is not None:
@@ -612,7 +865,8 @@ async def live_evaluate(rows, template, env):
                 write_cost_artifact(ledger, status)
             except Exception:
                 # Preserve the original evaluation failure; successful runs require observability.
-                if status == 'succeeded':
+                if status in ('succeeded', 'stopped', 'screen_failed'):
+                    # Every publishing run is billed; a missing cost artifact must not publish silently.
                     raise InvalidRun('cost_artifact_unavailable') from None
 
 
@@ -630,12 +884,44 @@ async def run(args, env=os.environ, evaluator=live_evaluate):
             raise InvalidRun('private_dataset_must_be_external')
     else:
         dataset = VENDOR / 'examples/problems_hard3_20.jsonl'
-    rows, dataset_hash, version = load_dataset(dataset, ranked=ranked)
+    rows, dataset_hash, version = load_dataset(dataset, ranked=ranked, manifest_path=ROOT / 'ranked-dataset.json')
     live_settings(env)  # Offline mode is tests, never a fake publishable score.
     candidate = env.get('GITHUB_SHA', '')
     if ranked and not re.fullmatch('[0-9a-f]{40}', candidate):
         raise InvalidRun('candidate_identity_missing')
-    result = await evaluator(rows, template, env)
+    screen_rows, screen_hash, screen_version = load_dataset(SCREEN_DATASET, ranked=False)
+    min_correct, max_parse_failures = screen_policy(env)
+    stop_enabled, record_url, round_questions = stop_policy(env)
+    screen = ScreenPanel(screen_rows, screen_hash, screen_version, min_correct, max_parse_failures)
+    record = None
+    # Always announce the record decision so a misconfigured environment is visible in the log.
+    if not ranked:
+        reason = 'public_run'
+    elif not stop_enabled:
+        reason = 'disabled'
+    elif not record_url:
+        reason = 'url_unset'
+    else:
+        record = await fetch_record(record_url)
+        reason = 'fetched' if record is not None else 'unavailable'
+    print(json.dumps({'event': 'record', 'recordCorrect': None if record is None else record['correct'],
+                      'reason': reason}), flush=True)
+    if ranked:
+        assert_screen_disjoint(screen_rows, rows)
+        result = await evaluator(rows, template, env, screen=screen,
+                                 record_correct=None if record is None else record['correct'],
+                                 shuffle_seed=private_shuffle_seed(), round_questions=round_questions)
+    else:
+        result = await evaluator(rows, template, env, include_verdicts=True)
+        panel = public_panel(screen, result['metrics'])
+        result['metrics'].pop('verdicts', None)
+        result['metrics'].update({'stage': 'public_complete', 'publicPanel': panel})
+    policy_on = stop_enabled and record_url is not None
+    result['metrics']['evaluationPolicy'] = {
+        'screen': {'panel': screen_version, 'minCorrect': min_correct, 'maxParseFailures': max_parse_failures},
+        'stopWhenImpossible': ranked and policy_on, 'roundQuestions': round_questions,
+        'record': record if record is not None else ('unavailable' if ranked and policy_on else 'disabled'),
+        'order': 'shuffled-question-major', 'shuffleSeed': 'private-random'}
     result['metrics'].update({'contractVersion': CONTRACT, 'datasetKind': 'ranked' if ranked else 'public',
                               'datasetVersion': version, 'datasetSha256': dataset_hash,
                               'configSha256': digest((VENDOR / 'evaluation_models.json').read_bytes()),
@@ -643,11 +929,14 @@ async def run(args, env=os.environ, evaluator=live_evaluate):
                               'promptBytes': len(data), 'promptSha256': digest(data),
                               'candidateSha': candidate, 'runId': env.get('GITHUB_RUN_ID', 'local'),
                               'runAttempt': env.get('GITHUB_RUN_ATTEMPT', 'local')})
+    if result['metrics'].get('stage') not in STAGES:
+        raise InvalidRun('stage_invalid')
     # Atomic publication; only this allowlisted aggregate object is exported.
     temporary = score_path.with_suffix('.json.tmp')
     temporary.write_text(json.dumps(result, allow_nan=False, sort_keys=True) + '\n')
     temporary.replace(score_path)
-    print(json.dumps({'score': result['score'], 'datasetKind': result['metrics']['datasetKind']}))
+    print(json.dumps({'score': result['score'], 'datasetKind': result['metrics']['datasetKind'],
+                      'stage': result['metrics']['stage']}))
 
 
 def main():
