@@ -1,6 +1,13 @@
 name: Math Distillation ranked evaluation
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "ranked (default, used by Yukon) or public (operator-only 20-question panel run; no ranked inference)"
+        required: false
+        default: ranked
+        type: choice
+        options: [ranked, public]
 permissions:
   contents: read
 # This workflow belongs to the separate operator repository, not Yukon's CI.
@@ -43,7 +50,7 @@ jobs:
           DISTILL_ROUND_QUESTIONS: ${{ vars.DISTILL_ROUND_QUESTIONS }}
           DISTILL_RECORD_SOURCE_URL: ${{ vars.DISTILL_RECORD_SOURCE_URL }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: ./benchmark.sh --ranked
+        run: ./benchmark.sh ${{ inputs.mode == 'public' && '' || '--ranked' }}
       - name: Upload trusted aggregate only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
